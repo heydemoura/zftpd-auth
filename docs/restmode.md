@@ -75,13 +75,13 @@ Exposed to clients via:
 
 ## ZHTTP client reconnect
 
-`web/js/api.js`:
+`web/js/api.js` (connection monitor) and `web/js/app.js` (status UI):
 
 - Health poll of `/api/status` every 5s
-- Two consecutive transport failures → `WaitingForWake`
-- Exponential backoff probe until `/api/status` succeeds
-- `remoteReady()` gates POST/upload while stale/reconnecting
-- Toasts via `app.js` on reconnect / daemon rotation
+- Two consecutive transport failures → offline banner in the UI
+- Exponential backoff probe (0.5s → 10s) until `/api/status` succeeds
+- `api.ready()` gates POST/upload while offline or reconnecting
+- Toast on reconnect; a changed `instance_id` is reported as a daemon restart
 
 ## What is preserved vs invalidated
 
@@ -91,7 +91,7 @@ Exposed to clients via:
 **Invalidated always:** live TCP sessions, PASV ports, in-flight transfers.
 
 **Client-side preserved across ZHTTP reconnect:** current path, UI view, theme.
-Listings are refreshed after `onReconnected`.
+Listings are refreshed on reconnect.
 
 ## Tests
 

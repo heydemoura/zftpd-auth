@@ -298,7 +298,7 @@ ifeq ($(ENABLE_ZHTTPD),1)
     SOURCES += src/http/http_static.c
     SOURCES += src/http/http_api_archive.c
     SOURCES += src/http/http_csrf.c
-    WEB_RESOURCE_FILES := $(shell find web -type f -print | sort)
+    WEB_RESOURCE_FILES := $(shell find web -path web/legacy -prune -o -type f -print | sort)
     HTTP_RESOURCES_C := $(BUILD_DIR)/generated/http/http_resources.c
     SOURCES += $(HTTP_RESOURCES_C)
     SOURCES += src/archive/exfat_unpacker.c
@@ -971,4 +971,4 @@ compile_commands.json:
 web-deploy:
 	@echo "  [WEB]  web-deploy is deprecated — web UI is now embedded in the binary"
 	@echo "  [WEB]  Resources are generated automatically under build/.../generated"
-	@echo "  [WEB]  Done — $(shell find web/css web/js -name '*.css' -o -name '*.js' | wc -l | tr -d ' ') files deployed"
+	@echo "  [WEB]  Done — $(shell find web -path web/legacy -prune -o \( -name '*.css' -o -name '*.js' \) -print | wc -l | tr -d ' ') files deployed"

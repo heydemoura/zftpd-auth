@@ -6,12 +6,17 @@ Walks the entire web/ directory recursively and produces a C file
 containing an http_resource_t[] table with every static asset embedded
 directly in the binary.  No filesystem serving is needed.
 
+The archived previous UI in web/legacy/ is kept in the source tree for
+reference only and is never embedded.
+
 Usage:
   python3 tools/generate_resources.py > build/<target>/<variant>/generated/http/http_resources.c
 """
 
 import os
 import sys
+
+EXCLUDED_DIRS = {"legacy"}
 
 MIME_MAP = {
     ".html": "text/html; charset=utf-8",
@@ -60,7 +65,9 @@ def main():
     # Collect files recursively, skipping junk
     entries = []
     for root, dirs, files in os.walk(web_dir):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        dirs[:] = [d for d in dirs
+                   if not d.startswith('.')
+                   and not (os.path.samefile(root, web_dir) and d in EXCLUDED_DIRS)]
         for fname in files:
             if fname.startswith('.') or fname.endswith('.bak') or fname.endswith('.legacy'):
                 continue
