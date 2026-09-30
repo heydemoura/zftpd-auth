@@ -231,6 +231,17 @@ static ftp_error_t pal_copy_cross_device_r_ex(const char *src, const char *dst,
   }
 
   if (S_ISREG(src_st.st_mode)) {
+    /* Moves that only fail at the root (e.g. merging into an existing
+     * folder on the same filesystem) can still rename file by file. */
+    if (keep_src == 0 && depth > 0U && rename(src, dst) == 0) {
+      uint64_t total = (uint64_t)src_st.st_size;
+      if (cumulative != NULL) {
+        *cumulative += total;
+        total = *cumulative;
+      }
+      if (cb != NULL && cb(total, user_data) < 0) return FTP_ERR_CANCELLED;
+      return FTP_OK;
+    }
     int local_errno = 0;
     int *errno_ptr = (out_errno != NULL) ? out_errno : &local_errno;
     ftp_error_t err =

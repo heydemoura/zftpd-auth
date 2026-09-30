@@ -502,7 +502,7 @@
       var src = srcs[i];
       job.detail = srcs.length > 1 ? (i + 1) + ' of ' + srcs.length + ' \u00b7 ' + P.base(src) : 'to ' + dest;
       changed();
-      return api.copy(src, dest).then(function () {
+      return api.copy(src, dest, mode === 'move').then(function () {
         return poll(job, api.copyProgress, function (st) {
           job.paused = !!st.paused;
           var cur = st.bytes_copied || 0;
@@ -515,11 +515,6 @@
         doneBytes += st.total_bytes || st.bytes_copied || 0;
         if (job.cancelRequested) throw cancelledError();
         if (st.error) throw new Error(copyErrorMessage(st));
-        if (mode === 'move') {
-          return api.remove(src, true).then(null, function (e) {
-            throw new Error('Copied, but the original could not be removed: ' + e.message);
-          });
-        }
       }).then(null, function (e) {
         if (e && e.cancelled) throw e;
         failures.push(P.base(src) + ': ' + e.message);

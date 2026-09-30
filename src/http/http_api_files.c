@@ -819,8 +819,7 @@ static int copy_progress_cb(uint64_t bytes_copied, void *user_data) {
 typedef struct {
   char src[FTP_PATH_MAX];
   char dst[FTP_PATH_MAX];
-  int *out_errno; /* points to g_copy_progress.error_errno storage (unused;
-                     errno captured inside) */
+  int keep_src; /* 0 = move (source entries removed after copy) */
 } copy_thread_args_t;
 
 static void *copy_thread_fn(void *arg) {
@@ -828,7 +827,7 @@ static void *copy_thread_fn(void *arg) {
 
   int saved_errno = 0;
   ftp_error_t rc = pal_file_copy_recursive_ex(
-      a->src, a->dst, 1, copy_progress_cb, NULL, &saved_errno);
+      a->src, a->dst, a->keep_src, copy_progress_cb, NULL, &saved_errno);
   if ((rc != FTP_OK) || (atomic_load(&g_copy_progress.cancel) != 0)) {
     atomic_store(&g_copy_progress.error, 1);
     atomic_store(&g_copy_progress.error_code, (int)rc);
@@ -983,6 +982,40 @@ static http_response_t *api_copy(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Final destination forbidden");
   }
 
+  char move_flag[8];
+  int is_move = http_api_parse_query_param(query, "move", move_flag,
+                                           sizeof(move_flag)) == 0 &&
+                strcmp(move_flag, "1") == 0;
+  if (is_move) {
+    if (strcmp(safe_src, http_api_get_root()) == 0) {
+      return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Cannot move root");
+    }
+    /* Same filesystem: a metadata-only rename, no data is copied. */
+    if (rename(safe_src, safe_final) == 0) {
+      atomic_store(&g_copy_progress.bytes_copied, 0U);
+      atomic_store(&g_copy_progress.total_bytes, 0U);
+      atomic_store(&g_copy_progress.error, 0);
+      atomic_store(&g_copy_progress.error_code, 0);
+      atomic_store(&g_copy_progress.error_errno, 0);
+      atomic_store(&g_copy_progress.cancel, 0);
+      atomic_store(&g_copy_progress.paused, 0);
+      atomic_store(&g_copy_progress.done, 1);
+      atomic_store(&g_copy_progress.active, 0);
+
+      http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+      http_response_add_header(resp, "Content-Type", "application/json");
+      http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
+      const char *body = "{\"ok\":true,\"async\":false,\"renamed\":true}";
+      http_response_set_body(resp, body, strlen(body));
+      return resp;
+    }
+    /* EXDEV: other filesystem. ENOTEMPTY/EEXIST: merge into an existing
+     * folder. Both continue as copy + per-entry source removal. */
+    if (errno != EXDEV && errno != ENOTEMPTY && errno != EEXIST) {
+      return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Move failed");
+    }
+  }
+
   /*
    * Compute total size for progress UI.
    * For a single file use stat(). For directories compute the real
@@ -1021,6 +1054,7 @@ static http_response_t *api_copy(const http_request_t *request) {
   args->src[sizeof(args->src) - 1U] = '\0';
   (void)strncpy(args->dst, safe_final, sizeof(args->dst) - 1U);
   args->dst[sizeof(args->dst) - 1U] = '\0';
+  args->keep_src = is_move ? 0 : 1;
 
   pthread_t tid;
   if (pthread_create(&tid, NULL, copy_thread_fn, args) != 0) {

@@ -270,7 +270,9 @@
   };
   api.rename = function (path, name) { return post('/api/rename' + qs({ path: path, name: name })); };
 
-  api.copy = function (src, dstDir) { return post('/api/copy' + qs({ path: src, dst: dstDir })); };
+  api.copy = function (src, dstDir, move) {
+    return post('/api/copy' + qs({ path: src, dst: dstDir, move: move ? 1 : null }));
+  };
   api.copyProgress = function () { return get('/api/copy_progress'); };
   api.copyCancel = function () { return post('/api/copy_cancel'); };
   api.copyPause = function () { return post('/api/copy_pause'); };

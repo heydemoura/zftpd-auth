@@ -29,6 +29,7 @@ SOFTWARE.
 #include "ftp_log.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,80 +37,131 @@ SOFTWARE.
 #include <sys/statvfs.h>
 #include <unistd.h>
 
-/* File-to-file copies use large writes; network write chunk limits do not apply. */
+/*
+ * Copy pipeline geometry.
+ *
+ *   readers --pread(chunk k)--> ring[k % SLOTS] --in-order write()--> dst
+ *
+ * - CHUNK: size of one read()/write() request. Large requests amortise the
+ *   per-syscall cost of PFS/exFAT and keep NVMe transfers big.
+ * - SLOTS: ring depth. More than two slots absorb write-latency jitter (PFS
+ *   flushes) so the reader never stalls on a single slow write.
+ * - READERS: concurrent pread() workers. Two readers keep more than one read
+ *   request in flight on NVMe (F_NOCACHE disables kernel read-ahead). The
+ *   single writer always writes chunks in file order, so the destination is
+ *   produced sequentially (no sparse gaps on exFAT/PFS).
+ */
 #ifndef PAL_FILE_COPY_BUFFER_SIZE
 #if defined(PLATFORM_PS5)
-#define PAL_FILE_COPY_BUFFER_SIZE                                              \
-  (4U * 1024U *                                                                \
-   1024U) /* 4 MB — NVMe ~215 MB/s, T_write=19ms covers T_read=12ms */
+#define PAL_FILE_COPY_BUFFER_SIZE (8U * 1024U * 1024U) /* NVMe / M.2 / USB */
 #elif defined(PLATFORM_PS4)
-#define PAL_FILE_COPY_BUFFER_SIZE                                              \
-  (1024U * 1024U) /* 1 MB — HDD ~85 MB/s,  T_write=12ms covers T_read=3ms  */
+#define PAL_FILE_COPY_BUFFER_SIZE (1024U * 1024U) /* HDD, tight memory */
 #else
-#define PAL_FILE_COPY_BUFFER_SIZE (4U * 1024U * 1024U) /* 4 MB */
+#define PAL_FILE_COPY_BUFFER_SIZE (8U * 1024U * 1024U)
 #endif
 #endif
 
-/* Large copies overlap source reads and destination writes. */
-#include <pthread.h>
+#ifndef PAL_FILE_COPY_SLOTS
+#define PAL_FILE_COPY_SLOTS 4U
+#endif
+
+#ifndef PAL_FILE_COPY_READERS
+#if defined(PLATFORM_PS4)
+#define PAL_FILE_COPY_READERS 1U /* avoid extra seeks on spinning disks */
+#else
+#define PAL_FILE_COPY_READERS 2U
+#endif
+#endif
+
+#if PAL_FILE_COPY_SLOTS < 2U
+#error "PAL_FILE_COPY_SLOTS must be at least 2"
+#endif
+#if PAL_FILE_COPY_READERS < 1U
+#error "PAL_FILE_COPY_READERS must be at least 1"
+#endif
+
+/* Files that fit in one chunk gain nothing from a reader thread. */
+#define PAL_COPY_PIPELINE_MIN_BYTES ((uint64_t)PAL_FILE_COPY_BUFFER_SIZE + 1U)
+
+enum { COPY_SLOT_FREE = 0, COPY_SLOT_BUSY = 1, COPY_SLOT_READY = 2 };
 
 typedef struct {
-  uint8_t *buf[2]; /* two PAL_FILE_COPY_BUFFER_SIZE buffers          */
-  size_t len[2];   /* bytes filled in each buffer (0 = free)         */
-  int fill_idx;    /* index reader is filling right now              */
-  int src_fd;      /* source file descriptor                         */
-  size_t buf_sz;   /* PAL_FILE_COPY_BUFFER_SIZE                      */
-  int done;        /* reader set to 1 on EOF or error                */
-  int reader_err;  /* errno from reader (0 = ok)                     */
+  uint8_t *buf[PAL_FILE_COPY_SLOTS];
+  size_t len[PAL_FILE_COPY_SLOTS];
+  int state[PAL_FILE_COPY_SLOTS];
+  unsigned nslots;
+  size_t chunk_sz;
+  int src_fd;
+  uint64_t size;       /* source size snapshot from stat()        */
+  uint64_t nchunks;    /* ceil(size / chunk_sz)                   */
+  uint64_t next_claim; /* next chunk index a reader will fetch    */
+  uint64_t next_write; /* next chunk index the writer will commit */
+  int stop;            /* writer finished, cancelled or failed    */
+  int reader_err;      /* first read errno (0 = ok)               */
   pthread_mutex_t mtx;
-  pthread_cond_t cv_ready; /* writer waits: "buffer filled and ready"        */
-  pthread_cond_t cv_free;  /* reader waits: "buffer drained and free"        */
-} copy_pipe_t;
+  pthread_cond_t cv_ready; /* writer waits for next chunk to be READY */
+  pthread_cond_t cv_free;  /* readers wait for their slot to be FREE  */
+} copy_ring_t;
 
-static void *copy_reader_thread(void *arg) {
-  copy_pipe_t *p = (copy_pipe_t *)arg;
-
-  pthread_mutex_lock(&p->mtx);
-  for (;;) {
-    int fi = p->fill_idx;
-
-    while ((p->len[fi] != 0U) && (p->done == 0)) {
-      pthread_cond_wait(&p->cv_free, &p->mtx);
-    }
-    if (p->done != 0) {
-      break;
-    }
-
-    pthread_mutex_unlock(&p->mtx);
-
-    ssize_t n;
-    do {
-      n = read(p->src_fd, p->buf[fi], p->buf_sz);
-    } while ((n < 0) && (errno == EINTR));
-
-    pthread_mutex_lock(&p->mtx);
-
-    if (n < 0) {
-      p->reader_err = errno;
-      p->done = 1;
-      pthread_cond_signal(&p->cv_ready);
-      break;
-    }
-    if (n == 0) {
-      p->done = 1;
-      pthread_cond_signal(&p->cv_ready);
-      break;
-    }
-
-    p->len[fi] = (size_t)n;
-    p->fill_idx = 1 - fi;
-    pthread_cond_signal(&p->cv_ready);
-  }
-  pthread_mutex_unlock(&p->mtx);
-  return NULL;
+static size_t copy_chunk_len(const copy_ring_t *r, uint64_t k) {
+  uint64_t off = k * (uint64_t)r->chunk_sz;
+  uint64_t rem = r->size - off;
+  return (rem < (uint64_t)r->chunk_sz) ? (size_t)rem : r->chunk_sz;
 }
 
-#define PAL_COPY_PIPELINE_MIN_BYTES ((uint64_t)PAL_FILE_COPY_BUFFER_SIZE * 2U)
+static void *copy_reader_thread(void *arg) {
+  copy_ring_t *r = (copy_ring_t *)arg;
+
+  pthread_mutex_lock(&r->mtx);
+  for (;;) {
+    if ((r->stop != 0) || (r->next_claim >= r->nchunks)) break;
+
+    uint64_t k = r->next_claim++;
+    unsigned s = (unsigned)(k % r->nslots);
+
+    /* Chunk k may only reuse its slot once chunk k - nslots has been
+     * written; checking next_write (not just the slot state) keeps two
+     * readers that map to the same slot from taking it out of order. */
+    while ((r->stop == 0) && ((k >= r->next_write + r->nslots) ||
+                              (r->state[s] != COPY_SLOT_FREE))) {
+      pthread_cond_wait(&r->cv_free, &r->mtx);
+    }
+    if (r->stop != 0) break;
+    r->state[s] = COPY_SLOT_BUSY;
+    pthread_mutex_unlock(&r->mtx);
+
+    uint8_t *dst = r->buf[s];
+    size_t want = copy_chunk_len(r, k);
+    off_t off = (off_t)(k * (uint64_t)r->chunk_sz);
+    size_t got = 0U;
+    int err = 0;
+    while (got < want) {
+      ssize_t n = pread(r->src_fd, dst + got, want - got, off + (off_t)got);
+      if (n > 0) {
+        got += (size_t)n;
+        continue;
+      }
+      if (n == 0) break; /* file shrank: short chunk ends the copy */
+      if (errno == EINTR) continue;
+      err = errno;
+      break;
+    }
+
+    pthread_mutex_lock(&r->mtx);
+    if (err != 0) {
+      if (r->reader_err == 0) r->reader_err = err;
+      r->stop = 1;
+      pthread_cond_broadcast(&r->cv_ready);
+      pthread_cond_broadcast(&r->cv_free);
+      break;
+    }
+    r->len[s] = got;
+    r->state[s] = COPY_SLOT_READY;
+    pthread_cond_broadcast(&r->cv_ready);
+  }
+  pthread_mutex_unlock(&r->mtx);
+  return NULL;
+}
 
 static int copy_write_full(int fd, const uint8_t *data, size_t size,
                            int *saved_errno) {
@@ -121,6 +173,7 @@ static int copy_write_full(int fd, const uint8_t *data, size_t size,
       continue;
     }
     if (n < 0 && errno == EINTR) continue;
+    /* PFS reports a full filesystem as write()==0. */
     if (saved_errno != NULL) *saved_errno = (n == 0) ? ENOSPC : errno;
     return -1;
   }
@@ -137,6 +190,218 @@ static ftp_error_t copy_report_progress(uint64_t bytes, uint64_t *cumulative,
   }
   if (cb != NULL && cb(total, user_data) < 0) return FTP_ERR_CANCELLED;
   return FTP_OK;
+}
+
+/* Allocates `count` chunks as one VM mapping; avoids the buddy allocator. */
+static uint8_t *copy_map_buffers(size_t chunk, unsigned count) {
+  void *p = mmap(NULL, chunk * (size_t)count, PROT_READ | PROT_WRITE,
+                 MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  return (p == MAP_FAILED) ? NULL : (uint8_t *)p;
+}
+
+/*
+ * Sequential copy from `offset` to EOF with pread()/write(). Used for small
+ * files, as a fallback when the pipeline cannot start, and to pick up bytes
+ * appended to the source after stat().
+ */
+static ftp_error_t copy_serial_from(int src_fd, int dst_fd, uint8_t *buf,
+                                    size_t buf_sz, uint64_t offset,
+                                    const char *src_path,
+                                    const char *dst_path,
+                                    pal_copy_progress_cb_t cb, void *user_data,
+                                    uint64_t *cumulative, int *out_errno) {
+  for (;;) {
+    ssize_t r = pread(src_fd, buf, buf_sz, (off_t)offset);
+    if (r > 0) {
+      int write_errno = 0;
+      if (copy_write_full(dst_fd, buf, (size_t)r, &write_errno) != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "[XDEV] write failed: errno=%d written_so_far=%llu dst=%.*s",
+                 write_errno, (unsigned long long)offset, PAL_LOG_PATH_CHARS,
+                 dst_path);
+        ftp_log_line(FTP_LOG_WARN, msg);
+        if (out_errno != NULL) *out_errno = write_errno;
+        return FTP_ERR_FILE_WRITE;
+      }
+      offset += (uint64_t)r;
+      if (copy_report_progress((uint64_t)r, cumulative, cb, user_data) ==
+          FTP_ERR_CANCELLED) {
+        return FTP_ERR_CANCELLED;
+      }
+      continue;
+    }
+    if (r == 0) return FTP_OK;
+    if (errno == EINTR) continue;
+
+    int e = errno;
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "[XDEV] read failed: errno=%d written_so_far=%llu src=%.*s", e,
+             (unsigned long long)offset, PAL_LOG_PATH_CHARS, src_path);
+    ftp_log_line(FTP_LOG_WARN, msg);
+    if (out_errno != NULL) *out_errno = e;
+    return FTP_ERR_FILE_READ;
+  }
+}
+
+/*
+ * Pipelined copy of a large file. Returns FTP_ERR_OUT_OF_MEMORY with
+ * *started == 0 when neither buffers nor a reader thread could be set up, so
+ * the caller can fall back to the serial path.
+ */
+static ftp_error_t copy_pipeline(int src_fd, int dst_fd, uint64_t size,
+                                 const char *src_path, const char *dst_path,
+                                 pal_copy_progress_cb_t cb, void *user_data,
+                                 uint64_t *cumulative, int *out_errno,
+                                 int *started) {
+  *started = 0;
+
+  size_t chunk = (size_t)PAL_FILE_COPY_BUFFER_SIZE;
+  unsigned nslots = PAL_FILE_COPY_SLOTS;
+  uint8_t *base = NULL;
+
+  /* Degrade gracefully under VM pressure: fewer slots, then smaller chunks. */
+  while (base == NULL) {
+    base = copy_map_buffers(chunk, nslots);
+    if (base != NULL) break;
+    if (nslots > 2U) {
+      nslots--;
+    } else if (chunk > (size_t)(1024U * 1024U)) {
+      chunk /= 2U;
+    } else {
+      char msg[256];
+      snprintf(msg, sizeof(msg),
+               "[XDEV] pipeline mmap failed: errno=%d — "
+               "falling back to serial copy for %.*s",
+               errno, PAL_LOG_PATH_CHARS, src_path);
+      ftp_log_line(FTP_LOG_WARN, msg);
+      return FTP_ERR_OUT_OF_MEMORY;
+    }
+  }
+
+  copy_ring_t ring;
+  memset(&ring, 0, sizeof(ring));
+  for (unsigned i = 0U; i < nslots; i++) {
+    ring.buf[i] = base + (size_t)i * chunk;
+    ring.state[i] = COPY_SLOT_FREE;
+  }
+  ring.nslots = nslots;
+  ring.chunk_sz = chunk;
+  ring.src_fd = src_fd;
+  ring.size = size;
+  ring.nchunks = (size + (uint64_t)chunk - 1U) / (uint64_t)chunk;
+  pthread_mutex_init(&ring.mtx, NULL);
+  pthread_cond_init(&ring.cv_ready, NULL);
+  pthread_cond_init(&ring.cv_free, NULL);
+
+  pthread_t readers[PAL_FILE_COPY_READERS];
+  unsigned nreaders = 0U;
+  unsigned want_readers = PAL_FILE_COPY_READERS;
+  if (want_readers > nslots - 1U) want_readers = nslots - 1U;
+  int pt_ret = 0;
+  for (unsigned i = 0U; i < want_readers; i++) {
+    pt_ret = pthread_create(&readers[nreaders], NULL, copy_reader_thread, &ring);
+    if (pt_ret != 0) break;
+    nreaders++;
+  }
+
+  ftp_error_t out_err = FTP_OK;
+
+  if (nreaders == 0U) {
+    /* PS4 can fail with EAGAIN (thread limit) or ENOMEM (stack). */
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "[XDEV] pthread_create failed: errno=%d — "
+             "falling back to serial copy for %.*s",
+             pt_ret, PAL_LOG_PATH_CHARS, src_path);
+    ftp_log_line(FTP_LOG_WARN, msg);
+    out_err = FTP_ERR_OUT_OF_MEMORY;
+    goto teardown;
+  }
+  *started = 1;
+
+  int write_failed = 0;
+  int write_errno = 0;
+  int cancelled = 0;
+  int short_eof = 0;
+  uint64_t written_total = 0U;
+
+  pthread_mutex_lock(&ring.mtx);
+  while (ring.next_write < ring.nchunks) {
+    unsigned s = (unsigned)(ring.next_write % ring.nslots);
+    while ((ring.state[s] != COPY_SLOT_READY) && (ring.stop == 0)) {
+      pthread_cond_wait(&ring.cv_ready, &ring.mtx);
+    }
+    if (ring.state[s] != COPY_SLOT_READY) break; /* reader error */
+
+    size_t nbytes = ring.len[s];
+    size_t expect = copy_chunk_len(&ring, ring.next_write);
+    pthread_mutex_unlock(&ring.mtx);
+
+    if (copy_write_full(dst_fd, ring.buf[s], nbytes, &write_errno) != 0) {
+      write_failed = 1;
+    } else {
+      written_total += (uint64_t)nbytes;
+      /* Callback runs unlocked: it may block (pause) without stalling readers
+       * on the mutex. */
+      if (copy_report_progress((uint64_t)nbytes, cumulative, cb, user_data) ==
+          FTP_ERR_CANCELLED) {
+        cancelled = 1;
+      }
+    }
+
+    pthread_mutex_lock(&ring.mtx);
+    if ((write_failed != 0) || (cancelled != 0)) break;
+    ring.state[s] = COPY_SLOT_FREE;
+    ring.next_write++;
+    pthread_cond_broadcast(&ring.cv_free);
+    if (nbytes < expect) {
+      short_eof = 1;
+      break;
+    }
+  }
+  ring.stop = 1;
+  pthread_cond_broadcast(&ring.cv_free);
+  pthread_cond_broadcast(&ring.cv_ready);
+  int reader_err = ring.reader_err;
+  pthread_mutex_unlock(&ring.mtx);
+
+  for (unsigned i = 0U; i < nreaders; i++) {
+    (void)pthread_join(readers[i], NULL);
+  }
+  if (reader_err == 0) reader_err = ring.reader_err;
+
+  /* Preserve write errors ahead of reader errors and cancellation. */
+  if (write_failed != 0) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[COPY] write failed: errno=%d dst=%.*s",
+             write_errno, PAL_LOG_PATH_CHARS, dst_path);
+    ftp_log_line(FTP_LOG_WARN, msg);
+    if (out_errno != NULL) *out_errno = write_errno;
+    out_err = FTP_ERR_FILE_WRITE;
+  } else if (reader_err != 0) {
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[COPY] read failed: errno=%d src=%.*s",
+             reader_err, PAL_LOG_PATH_CHARS, src_path);
+    ftp_log_line(FTP_LOG_WARN, msg);
+    if (out_errno != NULL) *out_errno = reader_err;
+    out_err = FTP_ERR_FILE_READ;
+  } else if (cancelled != 0) {
+    out_err = FTP_ERR_CANCELLED;
+  } else if (short_eof == 0) {
+    /* Bytes appended after stat() are still copied, as with read()-to-EOF. */
+    out_err = copy_serial_from(src_fd, dst_fd, ring.buf[0], ring.chunk_sz,
+                               written_total, src_path, dst_path, cb,
+                               user_data, cumulative, out_errno);
+  }
+
+teardown:
+  pthread_mutex_destroy(&ring.mtx);
+  pthread_cond_destroy(&ring.cv_ready);
+  pthread_cond_destroy(&ring.cv_free);
+  (void)munmap(base, chunk * (size_t)nslots);
+  return out_err;
 }
 
 static atomic_uint_fast32_t g_tmp_counter = ATOMIC_VAR_INIT(0U);
@@ -247,7 +512,7 @@ pal_file_copy_atomic_ex(const char *src_path, const char *dst_path,
   mode_t mode = (mode_t)(st.st_mode & 0777);
 
   /* PFS may report a full filesystem as write()==0, so reject known ENOSPC early. */
-  {
+  if (st.st_size > 0) {
     char dst_dir[FTP_PATH_MAX];
     if (fileio_parent_path(dst_path, dst_dir, sizeof(dst_dir)) == FTP_OK) {
       struct statvfs vfs;
@@ -266,7 +531,8 @@ pal_file_copy_atomic_ex(const char *src_path, const char *dst_path,
           if (out_errno != NULL) {
             *out_errno = ENOSPC;
           }
-          return FTP_ERR_FILE_WRITE;
+          out_err = FTP_ERR_FILE_WRITE;
+          goto cleanup;
         }
       }
     }
@@ -286,171 +552,32 @@ pal_file_copy_atomic_ex(const char *src_path, const char *dst_path,
   }
   tmp_created = 1;
 
-  /* VM-backed buffers avoid fragmenting the daemon buddy allocator. */
-  if (st.st_size == 0) goto copy_done;
+  if (st.st_size == 0) {
+    /* Still honour data appended after stat(), like the read-to-EOF path. */
+    uint8_t probe[4096];
+    out_err = copy_serial_from(src_fd, dst_fd, probe, sizeof(probe), 0U,
+                               src_path, dst_path, cb, user_data, cumulative,
+                               out_errno);
+    if (out_err != FTP_OK) goto cleanup;
+    goto copy_done;
+  }
 
   if ((uint64_t)st.st_size >= PAL_COPY_PIPELINE_MIN_BYTES) {
-    uint8_t *dbuf0 = (uint8_t *)mmap(NULL, PAL_FILE_COPY_BUFFER_SIZE,
-                                      PROT_READ | PROT_WRITE,
-                                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (dbuf0 == MAP_FAILED) { dbuf0 = NULL; }
-    uint8_t *dbuf1 = (uint8_t *)mmap(NULL, PAL_FILE_COPY_BUFFER_SIZE,
-                                      PROT_READ | PROT_WRITE,
-                                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (dbuf1 == MAP_FAILED) { dbuf1 = NULL; }
-
-    if ((dbuf0 != NULL) && (dbuf1 != NULL)) {
-      copy_pipe_t pipe;
-      pipe.buf[0] = dbuf0;
-      pipe.buf[1] = dbuf1;
-      pipe.len[0] = 0U;
-      pipe.len[1] = 0U;
-      pipe.fill_idx = 0;
-      pipe.src_fd = src_fd;
-      pipe.buf_sz = (size_t)PAL_FILE_COPY_BUFFER_SIZE;
-      pipe.done = 0;
-      pipe.reader_err = 0;
-      pthread_mutex_init(&pipe.mtx, NULL);
-      pthread_cond_init(&pipe.cv_ready, NULL);
-      pthread_cond_init(&pipe.cv_free, NULL);
-
-      pthread_t reader_tid;
-      int pt_ret = pthread_create(&reader_tid, NULL, copy_reader_thread, &pipe);
-      int thread_ok = (pt_ret == 0) ? 1 : 0;
-
-      /* Log pthread_create result — on PS4 this can fail with EAGAIN (thread
-       * limit) or ENOMEM (stack allocation failed under memory pressure). */
-      if (thread_ok == 0) {
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-                 "[XDEV] pthread_create failed: errno=%d — "
-                 "falling back to serial copy for %.*s",
-                 pt_ret, PAL_LOG_PATH_CHARS, src_path);
-        ftp_log_line(FTP_LOG_WARN, msg);
-      }
-
-      if (thread_ok != 0) {
-        ssize_t written = 0; /* last write result — checked after join */
-        int write_errno = 0; /* saved errno from the last failed write();
-                              * hoisted outside the for loop so it remains
-                              * accessible after break for the post-join log */
-        pthread_mutex_lock(&pipe.mtx);
-        for (;;) {
-          while ((pipe.len[1 - pipe.fill_idx] == 0U) && (pipe.done == 0)) {
-            pthread_cond_wait(&pipe.cv_ready, &pipe.mtx);
-          }
-
-          int drain_idx = 1 - pipe.fill_idx;
-          size_t nbytes = pipe.len[drain_idx];
-
-          if ((nbytes == 0U) && (pipe.done != 0)) {
-            break;
-          }
-
-          pthread_mutex_unlock(&pipe.mtx);
-
-          /* Keep file-to-file writes large to avoid PFS per-write overhead. */
-          write_errno = 0;
-          written = copy_write_full(dst_fd, pipe.buf[drain_idx], nbytes,
-                                    &write_errno) == 0
-                        ? (ssize_t)nbytes
-                        : -1;
-
-          pthread_mutex_lock(&pipe.mtx);
-
-          if (written < 0) {
-            /*
-             * Write error — signal reader to stop, then break.
-             * We log below after joining the reader thread.
-             */
-            if (out_errno != NULL) {
-              *out_errno = write_errno;
-            }
-            pipe.done = 1;
-            pthread_cond_signal(&pipe.cv_free);
-            out_err = FTP_ERR_FILE_WRITE;
-            break;
-          }
-
-          if (copy_report_progress((uint64_t)nbytes, cumulative, cb,
-                                   user_data) == FTP_ERR_CANCELLED) {
-            pipe.done = 1;
-            pthread_cond_signal(&pipe.cv_free);
-            out_err = FTP_ERR_CANCELLED;
-            break;
-          }
-
-          pipe.len[drain_idx] = 0U;
-          pthread_cond_signal(&pipe.cv_free);
-        }
-        pthread_mutex_unlock(&pipe.mtx);
-
-        (void)pthread_join(reader_tid, NULL);
-
-        /* Preserve write errors ahead of reader errors and cancellation. */
-        if (written < 0) {
-          char msg[256];
-          snprintf(msg, sizeof(msg), "[COPY] write failed: errno=%d dst=%.*s",
-                   write_errno, PAL_LOG_PATH_CHARS, dst_path);
-          ftp_log_line(FTP_LOG_WARN, msg);
-          if (out_errno != NULL) {
-            *out_errno = write_errno;
-          }
-          out_err = FTP_ERR_FILE_WRITE;
-        } else if (pipe.reader_err != 0) {
-          char msg[256];
-          snprintf(msg, sizeof(msg), "[COPY] read failed: errno=%d src=%.*s",
-                   pipe.reader_err, PAL_LOG_PATH_CHARS, src_path);
-          ftp_log_line(FTP_LOG_WARN, msg);
-          if (out_errno != NULL) {
-            *out_errno = pipe.reader_err;
-          }
-          out_err = FTP_ERR_FILE_READ;
-        } else if (out_err == FTP_ERR_CANCELLED) {
-        } else {
-          out_err = FTP_OK;
-        }
-      } else {
-        out_err = FTP_ERR_FILE_WRITE;
-      }
-
-      pthread_mutex_destroy(&pipe.mtx);
-      pthread_cond_destroy(&pipe.cv_ready);
-      pthread_cond_destroy(&pipe.cv_free);
-
-      (void)munmap(dbuf0, PAL_FILE_COPY_BUFFER_SIZE);
-      (void)munmap(dbuf1, PAL_FILE_COPY_BUFFER_SIZE);
-
-      if (thread_ok != 0) {
-        if (out_err != FTP_OK) {
-          goto cleanup;
-        }
-        goto copy_done;
-      }
-    } else {
-      {
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-                 "[XDEV] pipeline mmap failed (buf0=%s buf1=%s) — "
-                 "falling back to serial copy for %.*s",
-                 (dbuf0 != NULL) ? "ok" : "NULL",
-                 (dbuf1 != NULL) ? "ok" : "NULL",
-                 PAL_LOG_PATH_CHARS, src_path);
-        ftp_log_line(FTP_LOG_WARN, msg);
-      }
-      if (dbuf0 != NULL) { (void)munmap(dbuf0, PAL_FILE_COPY_BUFFER_SIZE); }
-      if (dbuf1 != NULL) { (void)munmap(dbuf1, PAL_FILE_COPY_BUFFER_SIZE); }
+    int started = 0;
+    out_err = copy_pipeline(src_fd, dst_fd, (uint64_t)st.st_size, src_path,
+                            dst_path, cb, user_data, cumulative, out_errno,
+                            &started);
+    if (started != 0) {
+      if (out_err != FTP_OK) goto cleanup;
+      goto copy_done;
     }
   }
 
+  /* VM-backed buffers avoid fragmenting the daemon buddy allocator. */
   copy_buf_size = ((uint64_t)st.st_size < (uint64_t)PAL_FILE_COPY_BUFFER_SIZE)
                       ? (size_t)st.st_size
                       : (size_t)PAL_FILE_COPY_BUFFER_SIZE;
-  copy_buf = (uint8_t *)mmap(NULL, copy_buf_size, PROT_READ | PROT_WRITE,
-                              MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-  if (copy_buf == MAP_FAILED) {
-    copy_buf = NULL;
-  }
+  copy_buf = copy_map_buffers(copy_buf_size, 1U);
   if (copy_buf == NULL) {
     {
       char msg[256];
@@ -465,58 +592,10 @@ pal_file_copy_atomic_ex(const char *src_path, const char *dst_path,
     goto cleanup;
   }
 
-  {
-    uint64_t serial_written = 0U;
-    for (;;) {
-      ssize_t r = read(src_fd, copy_buf, copy_buf_size);
-      if (r > 0) {
-        /* The serial fallback uses the same large-write primitive as the pipeline. */
-        int write_errno = 0;
-        if (copy_write_full(dst_fd, copy_buf, (size_t)r, &write_errno) != 0) {
-          char msg[256];
-          snprintf(msg, sizeof(msg),
-                   "[XDEV] write failed: errno=%d written_so_far=%llu "
-                   "file_size=%llu dst=%.*s",
-                   write_errno, (unsigned long long)serial_written,
-                   (unsigned long long)st.st_size, PAL_LOG_PATH_CHARS,
-                   dst_path);
-          ftp_log_line(FTP_LOG_WARN, msg);
-          if (out_errno != NULL) *out_errno = write_errno;
-          out_err = FTP_ERR_FILE_WRITE;
-          goto cleanup;
-        }
-        serial_written += (uint64_t)r;
-
-
-        if (copy_report_progress((uint64_t)r, cumulative, cb, user_data) ==
-            FTP_ERR_CANCELLED) {
-          out_err = FTP_ERR_CANCELLED;
-          goto cleanup;
-        }
-        continue;
-      }
-      if (r == 0) {
-        break;
-      }
-      if (errno == EINTR) {
-        continue;
-      }
-      {
-        int e = errno;
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-                 "[XDEV] read failed: errno=%d written_so_far=%llu src=%.*s",
-                 e, (unsigned long long)serial_written, PAL_LOG_PATH_CHARS,
-                 src_path);
-        ftp_log_line(FTP_LOG_WARN, msg);
-        if (out_errno != NULL) {
-          *out_errno = e;
-        }
-      }
-      out_err = FTP_ERR_FILE_READ;
-    goto cleanup;
-  } /* end serial for(;;) loop */
-  } /* end serial_written scope */
+  out_err = copy_serial_from(src_fd, dst_fd, copy_buf, copy_buf_size, 0U,
+                             src_path, dst_path, cb, user_data, cumulative,
+                             out_errno);
+  if (out_err != FTP_OK) goto cleanup;
 
 copy_done:;
 

@@ -41,10 +41,8 @@ SOFTWARE.
 
 #ifndef PAL_ALLOC_DEFAULT_SIZE
 /*
- * 16 MB — must hold two page-aligned PAL_FILE_COPY_BUFFER_SIZE (4 MB)
- * allocations plus buddy-allocator overhead (16-byte headers).
- * The buddy allocator rounds up 4 MB+16 to 8 MB per allocation.
- * 2 × 8 MB = 16 MB minimum for the double-buffer copy pipeline.
+ * 16 MB general-purpose arena. File-copy buffers are mmap()ed separately
+ * (see fileio/copy.c) so large copies never fragment this arena.
  */
 #define PAL_ALLOC_DEFAULT_SIZE (16U * 1024U * 1024U)
 #endif
