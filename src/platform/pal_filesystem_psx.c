@@ -37,11 +37,13 @@ SOFTWARE.
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
 
 #include "ftp_types.h"
+#include "ftp_log.h"
 #include "pal_fileio.h"
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -50,13 +52,10 @@ SOFTWARE.
 #include <sys/types.h>
 #include <unistd.h>
 
-#ifndef MAP_SELF
-#define MAP_SELF 0x80000
-#endif
-
 ftp_error_t psx_vfs_stat(const char *path, vfs_stat_t *out);
 int psx_vfs_try_open_self(vfs_node_t *node, const char *path);
 ssize_t psx_vfs_read(vfs_node_t *node, void *buffer, size_t length);
+void psx_vfs_release_map(vfs_node_t *node);
 
 #if defined(PLATFORM_PS5) && defined(__has_include)
 #if __has_include(<ps5/kernel.h>)
@@ -66,6 +65,8 @@ ssize_t psx_vfs_read(vfs_node_t *node, void *buffer, size_t length);
 #endif
 
 #if defined(PLATFORM_PS5) && defined(PS5_HAVE_KERNEL)
+#include "ps5_fw_offsets.h"
+
 #define PS5_SUPERPAGE_SIZE 0x200000U
 
 static atomic_int g_ps5_pager_resolved = ATOMIC_VAR_INIT(0);
@@ -80,118 +81,31 @@ static void ps5_resolve_pager_addresses(void)
         return;
     }
 
-    uint32_t fw = kernel_get_fw_version();
-    switch (fw >> 16) {
-        case 0x100:
-        case 0x101:
-        case 0x102:
-        case 0x105:
-        case 0x110:
-        case 0x111:
-        case 0x112:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xC27C40;
-            break;
-        case 0x113:
-        case 0x114:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xC27CA0;
-            break;
-        case 0x200:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xC4EF60;
-            break;
-        case 0x220:
-        case 0x225:
-        case 0x226:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xC4EFA0;
-            break;
-        case 0x230:
-        case 0x250:
-        case 0x270:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xC4F120;
-            break;
-        case 0x300:
-        case 0x310:
-        case 0x320:
-        case 0x321:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xCAF8C0;
-            break;
-        case 0x400:
-        case 0x402:
-        case 0x403:
-        case 0x450:
-        case 0x451:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xD20840;
-            break;
-        case 0x500:
-        case 0x502:
-        case 0x510:
-        case 0x550:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE0FEF0;
-            break;
-        case 0x600:
-        case 0x602:
-        case 0x650:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE30410;
-            break;
-        case 0x700:
-        case 0x701:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE310C0;
-            break;
-        case 0x720:
-        case 0x740:
-        case 0x760:
-        case 0x761:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE31180;
-            break;
-        case 0x800:
-        case 0x820:
-        case 0x840:
-        case 0x860:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE31250;
-            break;
-        case 0x900:
-        case 0x905:
-        case 0x920:
-        case 0x940:
-        case 0x960:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xDE0420;
-            break;
-        case 0x1000:
-        case 0x1001:
-        case 0x1020:
-        case 0x1040:
-        case 0x1060:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xDE04F0;
-            break;
-        case 0x1100:
-        case 0x1120:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xDF1940;
-            break;
-        case 0x1140:
-        case 0x1160:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xDF1960;
-            break;
-        case 0x1200:
-        case 0x1202:
-        case 0x1220:
-        case 0x1240:
-        case 0x1260:
-        case 0x1270:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xDF2860;
-            break;
-        case 0x1300:
-        case 0x1320:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE038D0;
-            break;
-        case 0x1340:
-            g_ps5_pager_table = (intptr_t)KERNEL_ADDRESS_DATA_BASE + 0xE03910;
-            break;
-        default:
-            g_ps5_pager_table = 0;
-            return;
+    const ps5_fw_offsets_t *offsets = ps5_fw_offsets_lookup(kernel_get_fw_version());
+    if ((offsets == NULL) || (offsets->pager_table_off == 0U)) {
+        g_ps5_pager_table = 0;
+        return;
     }
+
+    g_ps5_pager_table =
+        (intptr_t)KERNEL_ADDRESS_DATA_BASE + (intptr_t)offsets->pager_table_off;
 
     g_ps5_pager_ops_vnode = (intptr_t)kernel_getlong(g_ps5_pager_table + 2 * 8);
     g_ps5_pager_ops_self = (intptr_t)kernel_getlong(g_ps5_pager_table + 7 * 8);
+}
+
+void psx_pager_debug(uintptr_t *table, uintptr_t *ops_vnode, uintptr_t *ops_self)
+{
+#if defined(PLATFORM_PS5) && defined(PS5_HAVE_KERNEL)
+    ps5_resolve_pager_addresses();
+    if (table != NULL) *table = (uintptr_t)g_ps5_pager_table;
+    if (ops_vnode != NULL) *ops_vnode = (uintptr_t)g_ps5_pager_ops_vnode;
+    if (ops_self != NULL) *ops_self = (uintptr_t)g_ps5_pager_ops_self;
+#else
+    if (table != NULL) *table = 0U;
+    if (ops_vnode != NULL) *ops_vnode = 0U;
+    if (ops_self != NULL) *ops_self = 0U;
+#endif
 }
 
 static void *ps5_mmap_self(void *addr, size_t len, int prot, int flags, int fd, off_t offset)
@@ -204,15 +118,24 @@ static void *ps5_mmap_self(void *addr, size_t len, int prot, int flags, int fd, 
     }
 
     if (kernel_setlong(g_ps5_pager_table + 2 * 8, (uint64_t)g_ps5_pager_ops_self) != 0) {
+        errno = EIO;
         return MAP_FAILED;
     }
 
     void *data = mmap(addr, len, prot, flags, fd, offset);
+    int map_errno = errno;
 
     if (kernel_setlong(g_ps5_pager_table + 2 * 8, (uint64_t)g_ps5_pager_ops_vnode) != 0) {
+        if (data != MAP_FAILED) {
+            (void)munmap(data, len);
+        }
+        errno = EIO;
         return MAP_FAILED;
     }
 
+    if (data == MAP_FAILED) {
+        errno = map_errno;
+    }
     return data;
 }
 #endif
@@ -331,21 +254,53 @@ static int self_find_entry(int fd, uint16_t num_entries, uint16_t segment_index,
     return -1;
 }
 
-static void *self_map_segment(int fd, const Elf64_Phdr *phdr, uint16_t ind)
+static void *self_map_segment(int fd, const Elf64_Phdr *phdr, uint16_t ind,
+                              uint64_t delta, size_t *mapped_length)
 {
-    if (phdr->p_filesz == 0U) {
+    if (phdr->p_filesz == 0U || delta >= phdr->p_filesz || mapped_length == NULL) {
         errno = EINVAL;
         return NULL;
     }
 
-    int flags = MAP_PRIVATE | MAP_SELF;
-#ifdef MAP_ALIGNED
-    if (phdr->p_align != 0U) {
-        flags |= MAP_ALIGNED((int)phdr->p_align);
+    size_t map_len = (size_t)(phdr->p_filesz - delta);
+#if defined(PLATFORM_PS4)
+    /* PS4's SELF mmap uses the program-header index in the high 32 bits and
+     * the segment offset in the low bits.  Keep each mapping small, as the
+     * reference app dumper does, to avoid locking huge game segments. */
+    if (map_len > 0x100000U) map_len = 0x100000U;
+#endif
+
+    /* The temporary pager-table swap selects the SELF pager. 0x80000 is
+     * MAP_32BIT on PS5 and must not be passed as a separate MAP_SELF flag. */
+    int flags = MAP_PRIVATE;
+#if defined(PLATFORM_PS4)
+    /* The PS4 SELF mapping flag used by the original app dumper. */
+    flags |= 0x80000;
+#endif
+#if defined(MAP_ALIGNED) && !defined(PLATFORM_PS4)
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (phdr->p_align != 0U &&
+        (page_size <= 0 || phdr->p_align > (uint64_t)page_size)) {
+        /* FreeBSD expects log2(alignment), not the ELF alignment in bytes. */
+        uint64_t align = (uint64_t)phdr->p_align;
+        if ((align & (align - 1U)) != 0U) {
+            errno = EINVAL;
+            return NULL;
+        }
+        unsigned align_log2 = 0U;
+        while (align > 1U) {
+            align >>= 1U;
+            align_log2++;
+        }
+        if (align_log2 > 30U) {
+            errno = EINVAL;
+            return NULL;
+        }
+        flags |= MAP_ALIGNED(align_log2);
     }
 #endif
 
-    off_t off = (off_t)((uint64_t)ind << 32);
+    off_t off = (off_t)(((uint64_t)ind << 32) | delta);
 
 #if defined(PLATFORM_PS5) && defined(PS5_HAVE_KERNEL)
     if (kernel_get_fw_version() >= 0x9000000U) {
@@ -356,14 +311,41 @@ static void *self_map_segment(int fd, const Elf64_Phdr *phdr, uint16_t ind)
         off |= (off_t)(aligned_vaddr & (PS5_SUPERPAGE_SIZE - 1U));
     }
 
-    void *p = ps5_mmap_self(NULL, (size_t)phdr->p_filesz, PROT_READ, flags, fd, off);
+    void *p = ps5_mmap_self(NULL, map_len, PROT_READ, flags, fd, off);
 #else
-    void *p = mmap(NULL, (size_t)phdr->p_filesz, PROT_READ, flags, fd, off);
+    void *p = mmap(NULL, map_len, PROT_READ, flags, fd, off);
 #endif
     if (p == MAP_FAILED) {
+        int saved_errno = errno;
+        char msg[256];
+        (void)snprintf(msg, sizeof(msg),
+                       "[self] mmap failed seg=%u len=%llu off=0x%llx align=0x%llx flags=0x%x errno=%d",
+                       (unsigned)ind, (unsigned long long)map_len,
+                       (unsigned long long)(uint64_t)off,
+                       (unsigned long long)phdr->p_align, flags, saved_errno);
+        ftp_log_line(FTP_LOG_ERROR, msg);
+        errno = saved_errno;
         return NULL;
     }
 
+    /* PS5's temporary pager swap needs the fault within this call.  PS4's
+     * installed mmap patch remains active and its mapped window is small. */
+#if defined(PLATFORM_PS5)
+    if (mlock(p, map_len) != 0) {
+        int saved_errno = errno;
+        char msg[192];
+        (void)snprintf(msg, sizeof(msg),
+                       "[self] mlock failed seg=%u len=%llu errno=%d",
+                       (unsigned)ind, (unsigned long long)map_len,
+                       saved_errno);
+        ftp_log_line(FTP_LOG_ERROR, msg);
+        (void)munmap(p, map_len);
+        errno = saved_errno;
+        return NULL;
+    }
+#endif
+
+    *mapped_length = map_len;
     return p;
 }
 
@@ -479,18 +461,31 @@ int psx_vfs_try_open_self(vfs_node_t *node, const char *path)
     node->psx.phoff = (uint64_t)ehdr.e_phoff;
     node->psx.file_size = head.file_size;
     node->psx.magic = head.magic;
+    node->psx.mapped_segment = NULL;
+    node->psx.mapped_offset = 0U;
+    node->psx.mapped_length = 0U;
 
     return 1;
 }
 
-static int find_covering_phdr(int fd, const vfs_node_t *node, uint64_t offset, Elf64_Phdr *out, uint16_t *out_index)
+void psx_vfs_release_map(vfs_node_t *node)
+{
+    if (node == NULL || node->psx.mapped_segment == NULL) return;
+    (void)munmap(node->psx.mapped_segment, node->psx.mapped_length);
+    node->psx.mapped_segment = NULL;
+    node->psx.mapped_offset = 0U;
+    node->psx.mapped_length = 0U;
+}
+
+static int find_covering_phdr(int fd, const vfs_node_t *node, uint64_t offset,
+                              Elf64_Phdr *out, uint16_t *out_index,
+                              uint64_t *next_offset)
 {
     uint64_t elf_off = node->psx.elf_off;
     uint64_t phoff = node->psx.phoff;
     uint16_t phnum = node->psx.phnum;
 
     uint64_t best_next = UINT64_MAX;
-    int found = 0;
 
     for (uint16_t i = 0; i < phnum; i++) {
         Elf64_Phdr phdr;
@@ -512,11 +507,12 @@ static int find_covering_phdr(int fd, const vfs_node_t *node, uint64_t offset, E
 
         if ((phdr.p_filesz != 0U) && (start > offset) && (start < best_next)) {
             best_next = start;
-            found = 0;
         }
     }
 
-    (void)found;
+    if (next_offset != NULL) {
+        *next_offset = best_next;
+    }
     return 0;
 }
 
@@ -550,16 +546,59 @@ ssize_t psx_vfs_read(vfs_node_t *node, void *buffer, size_t length)
     while (done < to_read) {
         uint64_t cur_off = pos + (uint64_t)done;
 
+        /* mmap/mlock of an entire SELF segment is expensive. Reuse the
+         * populated mapping across successive reads of the same segment. */
+        if (node->psx.mapped_segment != NULL) {
+            uint64_t start = node->psx.mapped_offset;
+            uint64_t end = start + (uint64_t)node->psx.mapped_length;
+            if (cur_off >= start && cur_off < end) {
+                size_t chunk = to_read - done;
+                if ((uint64_t)chunk > end - cur_off) chunk = (size_t)(end - cur_off);
+                memcpy(dst + done, (const uint8_t *)node->psx.mapped_segment +
+                       (size_t)(cur_off - start), chunk);
+                done += chunk;
+                continue;
+            }
+            psx_vfs_release_map(node);
+        }
+
         Elf64_Phdr phdr;
         uint16_t seg_index = 0U;
-        int phdr_res = find_covering_phdr(node->psx.self_fd, node, cur_off, &phdr, &seg_index);
+        uint64_t next_segment = UINT64_MAX;
+        int phdr_res = find_covering_phdr(node->psx.self_fd, node, cur_off,
+                                          &phdr, &seg_index, &next_segment);
 
         if (phdr_res < 0) {
             return -1;
         }
 
+        /* The ELF header and program headers live in the unencrypted SELF
+         * prefix.  They must be present even when no PT_LOAD covers offset 0. */
+        uint64_t header_end = sizeof(Elf64_Ehdr);
+        uint64_t phdr_end = node->psx.phoff +
+                            (uint64_t)node->psx.phnum * sizeof(Elf64_Phdr);
+        if (phdr_end > header_end) {
+            header_end = phdr_end;
+        }
+        if (cur_off < header_end) {
+            size_t chunk = to_read - done;
+            if ((uint64_t)chunk > header_end - cur_off) {
+                chunk = (size_t)(header_end - cur_off);
+            }
+            if (read_exact(node->psx.self_fd, dst + done, chunk,
+                           (off_t)(node->psx.elf_off + cur_off)) != 0) {
+                return -1;
+            }
+            done += chunk;
+            continue;
+        }
+
         if (phdr_res == 0) {
             size_t zero_len = to_read - done;
+            if (next_segment != UINT64_MAX &&
+                (uint64_t)zero_len > next_segment - cur_off) {
+                zero_len = (size_t)(next_segment - cur_off);
+            }
             memset(dst + done, 0, zero_len);
             done += zero_len;
             continue;
@@ -577,42 +616,67 @@ ssize_t psx_vfs_read(vfs_node_t *node, void *buffer, size_t length)
 
         if (phdr.p_type == 0x6fffff01U) {
             off_t src_off = (off_t)((uint64_t)node->psx.file_size + delta);
-            if (read_exact(node->psx.self_fd, dst + done, chunk, src_off) != 0) {
-                return -1;
+            if (read_exact(node->psx.self_fd, dst + done, chunk, src_off) == 0) {
+                done += chunk;
+                continue;
             }
-            done += chunk;
-            continue;
-        }
-
-        self_entry_t ent;
-        if (self_find_entry(node->psx.self_fd, node->psx.num_entries, seg_index, entry_table_off, &ent) != 0) {
+            /* Version metadata lives outside the data area on some builds:
+             * zero it rather than aborting the whole transfer. */
             memset(dst + done, 0, chunk);
             done += chunk;
             continue;
         }
 
-        int encrypted = (ent.props.is_encrypted != 0U) || (ent.props.is_compressed != 0U);
-        if (!encrypted) {
-            off_t src_off = (off_t)((uint64_t)ent.offset + delta);
-            if (read_exact(node->psx.self_fd, dst + done, chunk, src_off) != 0) {
-                return -1;
-            }
+        /*
+         * Loadable segment types: only those carry data.  Anything else is
+         * padding in the ELF image.
+         */
+        if ((phdr.p_type != 0x1U) &&          /* PT_LOAD          */
+            (phdr.p_type != 0x61000000U) &&   /* PT_SCE_DYNLIBDATA */
+            (phdr.p_type != 0x61000010U) &&   /* PT_SCE_RELRO      */
+            (phdr.p_type != 0x6fffff00U)) {   /* PT_SCE_COMMENT    */
+            memset(dst + done, 0, chunk);
             done += chunk;
             continue;
         }
 
-        pthread_mutex_lock(&g_self_map_lock);
-        void *map = self_map_segment(node->psx.self_fd, &phdr, seg_index);
-        if (map == NULL) {
-            pthread_mutex_unlock(&g_self_map_lock);
-            return -1;
-        }
+        self_entry_t ent;
+        int have_entry = (self_find_entry(node->psx.self_fd, node->psx.num_entries,
+                                          seg_index, entry_table_off, &ent) == 0);
 
-        memcpy(dst + done, (const uint8_t *)map + delta, chunk);
-        (void)munmap(map, (size_t)phdr.p_filesz);
+        /*
+         * Always go through the self pager: the kernel decrypts whatever needs
+         * decrypting, so a mis-read segment table cannot route the read into
+         * ciphertext.  The entry is only used as a fallback when the mapping
+         * itself fails.
+         */
+        pthread_mutex_lock(&g_self_map_lock);
+        size_t mapped_length = 0U;
+        void *map = self_map_segment(node->psx.self_fd, &phdr, seg_index,
+                                     delta, &mapped_length);
         pthread_mutex_unlock(&g_self_map_lock);
 
-        done += chunk;
+        if (map != NULL) {
+            node->psx.mapped_segment = map;
+            node->psx.mapped_offset = cur_off;
+            node->psx.mapped_length = mapped_length;
+            if (chunk > mapped_length) chunk = mapped_length;
+            memcpy(dst + done, map, chunk);
+            done += chunk;
+            continue;
+        }
+
+        if (have_entry && (ent.props.is_encrypted == 0U) && (ent.props.is_compressed == 0U)) {
+            off_t src_off = (off_t)((uint64_t)ent.offset + delta);
+            if (read_exact(node->psx.self_fd, dst + done, chunk, src_off) == 0) {
+                done += chunk;
+                continue;
+            }
+        }
+
+        /* A missing decrypted segment is a failed dump.  Its advertised size
+         * must not be fulfilled with fabricated zero bytes. */
+        return -1;
     }
 
     node->offset += (uint64_t)done;

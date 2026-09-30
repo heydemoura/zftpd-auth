@@ -86,8 +86,10 @@
  *
  * FIRMWARE SUPPORT
  * ----------------
- *   Supported firmware versions (sysent offsets validated):
- *     4.03, 7.00, 7.61, 8.20, 8.60, 9.00, 9.40, 9.60, 10.00, 10.01, 10.50
+ *   The supported firmware matrix (and every per-firmware kernel offset) lives
+ *   in ONE place: src/platform/ps5/ps5_fw_offsets.c, shared with the SELF
+ *   pager.  A firmware whose row carries no sysent offset is treated as
+ *   unsupported here.
  *
  *   Unsupported firmware: install() returns PS5_NET_FILTER_ERR_FW_UNSUPPORTED.
  *

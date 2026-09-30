@@ -47,6 +47,7 @@ SOFTWARE.
 int psx_vfs_try_open_self(vfs_node_t *node, const char *path);
 ftp_error_t psx_vfs_stat(const char *path, vfs_stat_t *out);
 ssize_t psx_vfs_read(vfs_node_t *node, void *buffer, size_t length);
+void psx_vfs_release_map(vfs_node_t *node);
 #endif
 
 ftp_error_t vfs_stat(const char *path, vfs_stat_t *out)
@@ -141,6 +142,7 @@ void vfs_close(vfs_node_t *node)
 
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
     if ((node->caps & VFS_CAP_STREAM_ONLY) != 0U) {
+        psx_vfs_release_map(node);
         if (node->psx.self_fd >= 0) {
             pal_file_close(node->psx.self_fd);
         }

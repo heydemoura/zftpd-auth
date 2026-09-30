@@ -63,13 +63,11 @@
  *      e) Otherwise                                          → allow
  *
  * 4. FIRMWARE TABLE
- *    The sysent table base address is firmware-specific. The kstuff offsets
- *    used here are relative to KERNEL_ADDRESS_DATA_BASE, not the kernel
- *    .text base. We maintain a table of these offsets for all supported
- *    firmware versions.
- *
- *    Offsets are derived from public PS5 kernel symbol dumps and verified
- *    against known kstuff research.
+ *    The sysent table base address is firmware-specific and relative to
+ *    KERNEL_ADDRESS_DATA_BASE, not to the kernel .text base.  The offsets come
+ *    from ps5_fw_offsets.c, the single firmware table in zftpd (shared with
+ *    the SELF pager swap), so a new firmware is described in exactly one
+ *    place.
  *
  * @note  Compiled only when PLATFORM_PS5 is defined.
  */
@@ -77,6 +75,7 @@
 #ifdef PLATFORM_PS5
 
 #include "ps5_net_filter.h"
+#include "ps5_fw_offsets.h"
 #include "ftp_log.h"
 #include "pal_notification.h"
 
@@ -87,8 +86,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 
 /* PS5 payload SDK kernel primitives */
@@ -157,21 +154,32 @@ static int kernel_get_phys_addr(uintptr_t va, uint64_t *pa_out) {
    * proc → p_vmspace → vm_pmap.pm_cr3 (offset 0x10 in pmap) */
   intptr_t proc_kaddr = kernel_get_proc(getpid());
   if (proc_kaddr == 0) {
-    return -1;
+    return -1; /* step 1: kernel_get_proc */
   }
 
   intptr_t vmspace_ptr = 0;
   if (kernel_copyout(proc_kaddr + (intptr_t)KERNEL_OFFSET_PROC_P_VMSPACE,
                      &vmspace_ptr, sizeof(vmspace_ptr)) != 0) {
-    return -1;
+    return -2; /* step 2: struct proc.p_vmspace */
   }
   if (vmspace_ptr == 0) {
-    return -1;
+    return -2;
   }
 
+  /*
+   * vm_pmap does not start at the vmspace base: it sits at
+   * KERNEL_OFFSET_VMSPACE_VM_PMAP, and the page-table root (cr3) is at +0x28
+   * inside it — the layout the SDK's own DMAP derivation walks.  Reading cr3
+   * at a wrong offset made every physical-address lookup fail, which aborted
+   * the kernel exec page allocation.
+   */
   uint64_t cr3 = 0;
-  if (kernel_copyout(vmspace_ptr + 0x10, &cr3, sizeof(cr3)) != 0) {
-    return -1;
+  if (kernel_copyout(vmspace_ptr + (intptr_t)KERNEL_OFFSET_VMSPACE_VM_PMAP + 0x28,
+                     &cr3, sizeof(cr3)) != 0) {
+    return -3; /* step 3: vmspace.pmap.pm_cr3 */
+  }
+  if (cr3 == 0U) {
+    return -3;
   }
 
   uint64_t v = (uint64_t)va;
@@ -268,98 +276,25 @@ static int kernel_clear_pte_nx(uintptr_t va) {
 #define HOOK_SHARED_DATA_OFFSET 0x480U  /**< ps5_hook_shared_t data  */
 
 /*===========================================================================*
- * FIRMWARE SYSENT TABLE
+ * FIRMWARE TABLE
+ *
+ * The per-firmware sysent offsets live in src/platform/ps5/ps5_fw_offsets.c,
+ * next to the SELF pager offsets: one table, one row per firmware, shared by
+ * every consumer.  A row whose sysent_off is 0 means "not verified for this
+ * release" and install() refuses to touch the kernel instead of guessing.
  *===========================================================================*/
 
-/**
- * Per-firmware sysent offset from kernel_base.
- *
- * HOW THESE WERE OBTAINED
- * -----------------------
- * Each entry is derived from:
- *   1. PS5 kernel ELF symbol dump (available for FW 1.xx – 4.xx via WebKit
- *      exploits that leak the kernel .text segment).
- *   2. Pattern scanning for the first 8 sysent entries (known syscall indices
- *      0–7 have stable arg counts: nosys=0, exit=1, fork=0, read=3, ...).
- *   3. Cross-referenced against ps5-kstuff offset tables.
- *
- * TO ADD A NEW FIRMWARE
- * ---------------------
- *   1. Obtain kernel_base for that firmware (via the exploit chain).
- *   2. Pattern-scan for `sysent`:
- *        uint64_t sysent_pattern[] = { 0x00000000, 0x00000001, ... };
- *        // sysent[0].sy_narg=0 (nosys), sysent[1].sy_narg=1 (exit), ...
- *   3. Add the (fw_version, sysent_offset) pair to the table below.
- *
- * @note  fw_version encoding: major * 100 + minor  (e.g. 4.03 → 403)
+/*
+ * CALIBRATION PROCEDURE (per firmware)
+ * ------------------------------------
+ *   1. Dump the kernel .data segment via kernel_copyout() in chunks.
+ *   2. Pattern-scan for sysent:
+ *        [sysent+0x00] = 0x00000000  (nosys nargs = 0)
+ *        [sysent+0x48] = 0x00000001  (exit  nargs = 1)
+ *        [sysent+0x90] = 0x00000000  (fork  nargs = 0)
+ *   3. Verify sysent[98].sy_call resolves to a recognisable connect handler.
+ *   4. Record the offset in the shared table (see banner above).
  */
-typedef struct {
-  uint32_t fw_version;      /**< Encoded firmware version (e.g. 403 = 4.03) */
-  uint64_t sysent_offset;   /**< sysent[] offset from KERNEL_ADDRESS_DATA_BASE */
-  uint64_t thread_proc_off; /**< td->td_proc offset within struct thread */
-  uint64_t proc_pid_off;    /**< p_pid offset within struct proc */
-} ps5_fw_entry_t;
-
-/**
- * Firmware support table.
- *
- * IMPORTANT: All offsets must be verified against actual kernel images.
- *            Incorrect values will cause a kernel panic.
- *
- * Sources:
- *   - https://github.com/EchoStretch/kstuff  (kstuff offset tables)
- *   - https://github.com/john-tornblom/ps5-payload-sdk (known offsets)
- *   - PS5 kernel research by Specter, ChendoChap, and the fail0verflow team
- */
-static const ps5_fw_entry_t g_fw_table[] = {
-    /*
-     * fw_version | sysent_offset      | thread_proc_off | proc_pid_off
-     * -----------+--------------------+-----------------+-------------
-     * Values are relative to KERNEL_ADDRESS_DATA_BASE.
-     *
-     * NOTE: These offsets are placeholders derived from public research.
-     *       They MUST be validated against the actual kernel image for each
-     *       firmware version before production use.
-     *
-     * CALIBRATION PROCEDURE (per firmware):
-     *   1. Dump kernel .data segment via kernel_copyout() in chunks.
-     *   2. Search for the sysent pattern:
-     *        bytes at [sysent+0x00] = 0x00000000  (nosys nargs = 0)
-     *        bytes at [sysent+0x48] = 0x00000001  (exit  nargs = 1)
-     *        bytes at [sysent+0x90] = 0x00000000  (fork  nargs = 0)
-     *   3. Verify sysent[98].sy_call resolves to a recognisable connect
-     * handler.
-     *   4. Find struct thread layout via known curthread pattern from pcpu.
-     *   5. Update this table.
-     */
-    {403, 0x001709C0ULL, 0x008ULL, 0x060ULL},  /* FW 4.03 - verified kstuff */
-    {700, 0x001B7030ULL, 0x008ULL, 0x060ULL},  /* FW 7.00 - verified kstuff */
-    {761, 0x001B7260ULL, 0x008ULL, 0x060ULL},  /* FW 7.61 - verified kstuff */
-    {820, 0x001A7DB0ULL, 0x008ULL, 0x060ULL},  /* FW 8.20 - verified kstuff */
-    {860, 0x001A7DB0ULL, 0x008ULL, 0x060ULL},  /* FW 8.60 - verified kstuff */
-    {900, 0x001AAC10ULL, 0x008ULL, 0x060ULL},  /* FW 9.00 - verified kstuff */
-    {905, 0x001AAC10ULL, 0x008ULL, 0x060ULL},  /* FW 9.05 - verified kstuff */
-    {920, 0x001AAC60ULL, 0x008ULL, 0x060ULL},  /* FW 9.20 - verified kstuff */
-    {940, 0x001AAC60ULL, 0x008ULL, 0x060ULL},  /* FW 9.40 - verified kstuff */
-    {960, 0x001AAC60ULL, 0x008ULL, 0x060ULL},  /* FW 9.60 - verified kstuff */
-    {1000, 0x001AD100ULL, 0x008ULL, 0x060ULL}, /* FW 10.00 - verified kstuff */
-    {1001, 0x001AD100ULL, 0x008ULL, 0x060ULL}, /* FW 10.01 - verified kstuff */
-    {1020, 0x001AD120ULL, 0x008ULL, 0x060ULL}, /* FW 10.20 - verified kstuff */
-    {1040, 0x001AD120ULL, 0x008ULL, 0x060ULL}, /* FW 10.40 - verified kstuff */
-    {1060, 0x001AD120ULL, 0x008ULL, 0x060ULL}, /* FW 10.60 - verified kstuff */
-    {1100, 0x001B0B70ULL, 0x008ULL, 0x060ULL}, /* FW 11.00 - verified kstuff */
-    {1120, 0x001B0B70ULL, 0x008ULL, 0x060ULL}, /* FW 11.20 - verified kstuff */
-    {1140, 0x001B0B20ULL, 0x008ULL, 0x060ULL}, /* FW 11.40 - verified kstuff */
-    {1160, 0x001B08E0ULL, 0x008ULL, 0x060ULL}, /* FW 11.60 - verified kstuff */
-    {1200, 0x001AF4D0ULL, 0x008ULL, 0x060ULL}, /* FW 12.00 - verified kstuff */
-    {1202, 0x001AF4D0ULL, 0x008ULL, 0x060ULL}, /* FW 12.02 - same as 12.00 */
-    {1220, 0x001AF4D0ULL, 0x008ULL, 0x060ULL}, /* FW 12.20 - same as 12.00 */
-    {1240, 0x001AF4D0ULL, 0x008ULL, 0x060ULL}, /* FW 12.40 - same as 12.00 */
-    {1260, 0x001AF4D0ULL, 0x008ULL, 0x060ULL}, /* FW 12.60 - same as 12.00 */
-    {1270, 0x001AF4D0ULL, 0x008ULL, 0x060ULL}, /* FW 12.70 - same as 12.00 */
-};
-
-#define FW_TABLE_COUNT (sizeof(g_fw_table) / sizeof(g_fw_table[0]))
 
 /*===========================================================================*
  * DEFAULT SONY IP BLOCK LIST
@@ -668,104 +603,14 @@ static const uint8_t g_hook_sendto_code[] = {
 #define HOOK_SENDTO_CODE_SIZE sizeof(g_hook_sendto_code)
 
 /*===========================================================================*
- * FIRMWARE DETECTION
+ * FIRMWARE IDENTIFICATION
+ *
+ * kernel_get_fw_version() from the ps5-payload-sdk reads the SDK version out
+ * of libSceLibcInternal, so it keeps reporting the real version on consoles
+ * whose kernel version string has been spoofed.  ps5_fw_offsets_lookup()
+ * normalizes it to the table key; a NULL result or a zero sysent_off means
+ * "this firmware is not covered" and the install is refused.
  *===========================================================================*/
-
-/**
- * @brief Read the PS5 firmware version from sysctl.
- *
- * @param[out] version  Encoded version (major * 100 + minor).
- *
- * @return 0 on success, -1 on failure.
- *
- * @note Uses kern.osrelease sysctl, which returns a string like "11.00".
- *       We map this to the PS5 firmware by cross-referencing with known
- *       kernel osrelease strings per firmware version.
- *
- * KNOWN MAPPINGS (PS5 FreeBSD osrelease → PS5 firmware version)
- * ---------------------------------------------------------------
- *   osrelease = "9.00"  → checked via kern.version for PS5-specific string
- *   PS5 FW 4.03 ships FreeBSD kernel 11.00 with Sony custom patches.
- *   The actual FW version is in /system/contents/version.txt or via
- *   the sceKernelGetSystemSwVersion() syscall (SCE-specific).
- *
- *   We use syscall(0x14D) (sceKernelGetSystemSwVersion) which returns
- *   a packed 32-bit value: bits[31:16] = major, bits[15:8] = minor.
- */
-static int detect_firmware_version(uint32_t *version) {
-  if (version == NULL) {
-    return -1;
-  }
-
-  /*
-   * sceKernelGetSystemSwVersion() — PS5 proprietary syscall.
-   *
-   * Syscall number 0x14D (333 decimal) on PS5 FreeBSD.
-   * Returns a packed firmware version in eax:
-   *   bits [31:16] = major (e.g. 0x0A00 for FW 10.00)
-   *   bits [15:8]  = minor (e.g. 0x00 for .00, 0x01 for .01)
-   *   bits [7:0]   = patch (usually 0)
-   *
-   * On error (non-PS5 system), syscall returns -1; we fall back to sysctl.
-   */
-  uint64_t sw_ver = (uint64_t)syscall(0x14D);
-
-  if ((int64_t)sw_ver > 0) {
-    uint32_t major = (uint32_t)((sw_ver >> 16U) & 0xFFU);
-    uint32_t minor = (uint32_t)((sw_ver >> 8U) & 0xFFU);
-    *version = major * 100U + minor;
-    return 0;
-  }
-
-  /*
-   * Fallback: parse kern.osrelease.
-   *
-   * This won't give us the PS5 firmware version directly, but combined
-   * with runtime pattern scanning, it can narrow down candidates.
-   * Documented as a fallback only — prefer the syscall path above.
-   */
-  char rel[64] = {0};
-  size_t rel_len = sizeof(rel) - 1U;
-
-  if (sysctlbyname("kern.osrelease", rel, &rel_len, NULL, 0) != 0) {
-    return -1;
-  }
-
-  /* Attempt simple major.minor parse — useful for dev/test environments */
-  unsigned int maj = 0U;
-  unsigned int min = 0U;
-  if (sscanf(rel, "%u.%u", &maj, &min) == 2) {
-    *version = maj * 100U + min;
-    return 0;
-  }
-
-  return -1;
-}
-
-/**
- * @brief Look up the firmware entry for a given version.
- *
- * @param[in]  version  Encoded firmware version.
- * @param[out] entry    Pointer to matching entry in g_fw_table[].
- *
- * @return 0 on success, -1 if not found.
- *
- * @note O(n) linear scan; n = FW_TABLE_COUNT ≤ 16.  WCET is bounded.
- */
-static int lookup_fw_entry(uint32_t version, const ps5_fw_entry_t **entry) {
-  if (entry == NULL) {
-    return -1;
-  }
-
-  for (size_t i = 0U; i < FW_TABLE_COUNT; i++) {
-    if (g_fw_table[i].fw_version == version) {
-      *entry = &g_fw_table[i];
-      return 0;
-    }
-  }
-
-  return -1;
-}
 
 /*===========================================================================*
  * SYSENT VALIDATION
@@ -901,7 +746,13 @@ static int alloc_kernel_exec_page(uintptr_t *kaddr) {
    * the physical address of a userland VA.
    */
   uint64_t phys_addr = 0U;
-  if (kernel_get_phys_addr((uintptr_t)uland_page, &phys_addr) != 0) {
+  int walk_rc = kernel_get_phys_addr((uintptr_t)uland_page, &phys_addr);
+  if (walk_rc != 0) {
+    char detail[160];
+    (void)snprintf(detail, sizeof(detail),
+                   "[net_filter] physical lookup failed at step %d (page %p)",
+                   -walk_rc, uland_page);
+    ftp_log_line(FTP_LOG_ERROR, detail);
     munmap(uland_page, HOOK_PAGE_SIZE);
     return -1;
   }
@@ -910,22 +761,10 @@ static int alloc_kernel_exec_page(uintptr_t *kaddr) {
   uintptr_t kernel_va = (uintptr_t)(DMAP_BASE_ADDR + phys_addr);
 
   /*
-   * Clear the NX (No-Execute) bit in the PTE.
-   *
-   * The PTE is at: cr3 → PML4[VA[47:39]] → PDPT[VA[38:30]]
-   *                     → PD[VA[29:21]] → PT[VA[20:12]]
-   *
-   * ps5-payload-sdk provides kernel_clear_pte_nx(va) which performs
-   * this traversal using kernel r/w primitives.
+   * The executable protection is applied by the caller, after the hook bytes
+   * are in place: on PS5 the hypervisor enforces W^X, so a page is written
+   * while it is still RW and only then flipped to executable.
    */
-  if (kernel_clear_pte_nx(kernel_va) != 0) {
-    /* If NX clear fails, the page still works as a data-only hook
-     * via the JMP trampoline approach (indirect call, not direct exec). */
-    ftp_log_line(
-        FTP_LOG_WARN,
-        "[net_filter] NX clear failed; hook may be limited to passthrough");
-  }
-
   *kaddr = kernel_va;
 
   /*
@@ -952,13 +791,13 @@ static int alloc_kernel_exec_page(uintptr_t *kaddr) {
  * Reads the current sysent[SYS_CONNECT].sy_call and checks if it points
  * to the kernel text (original) or to a DMAP page (external hook).
  *
- * @param fw_entry  Firmware entry with sysent offset info.
+ * @param fw_offsets  Firmware row holding the sysent offset info.
  *
  * @return 1 if external hook detected (another payload installed),
  *         0 if sysent is clean (points to kernel text or is invalid).
  */
-static int is_external_hook_installed(const ps5_fw_entry_t *fw_entry) {
-  if (fw_entry == NULL || fw_entry->sysent_offset == 0U) {
+static int is_external_hook_installed(const ps5_fw_offsets_t *fw_offsets) {
+  if (fw_offsets == NULL || fw_offsets->sysent_off == 0U) {
     return 0;  /* Cannot determine, assume clean */
   }
 
@@ -969,7 +808,7 @@ static int is_external_hook_installed(const ps5_fw_entry_t *fw_entry) {
 
   /* Calculate sysent[SYS_CONNECT].sy_call kernel address */
   uintptr_t sysent_kaddr =
-      (uintptr_t)(kdata_base + fw_entry->sysent_offset) +
+      (uintptr_t)(kdata_base + fw_offsets->sysent_off) +
       (uintptr_t)(SYS_CONNECT * SYSENT_ENTRY_SIZE) + SYSENT_SY_CALL_OFFSET;
 
   /* Read current handler address via kernel_copyout */
@@ -1074,21 +913,24 @@ int ps5_net_filter_install(const ps5_net_filter_config_t *cfg) {
   }
 
   /* ------------------------------------------------------------------ */
-  /* Step 2: Detect firmware version                                      */
+  /* Step 2: Resolve the running firmware in the shared offset table      */
   /* ------------------------------------------------------------------ */
 
-  uint32_t fw_version = 0U;
-  if (detect_firmware_version(&fw_version) != 0) {
+  uint32_t fw_version = kernel_get_fw_version();
+  if (fw_version == 0U) {
+    ftp_log_line(FTP_LOG_ERROR, "[net_filter] firmware detection failed");
     rc = PS5_NET_FILTER_ERR_FW_DETECT;
     goto fail;
   }
 
-  const ps5_fw_entry_t *fw_entry = NULL;
-  if (lookup_fw_entry(fw_version, &fw_entry) != 0) {
+  uint32_t fw_key = ps5_fw_normalize(fw_version);
+
+  const ps5_fw_offsets_t *fw_offsets = ps5_fw_offsets_lookup(fw_version);
+  if ((fw_offsets == NULL) || (fw_offsets->sysent_off == 0U)) {
     char msg[128];
     (void)snprintf(msg, sizeof(msg),
                    "[net_filter] FW %u.%02u not in support table",
-                   fw_version / 100U, fw_version % 100U);
+                   fw_key / 100U, fw_key % 100U);
     ftp_log_line(FTP_LOG_WARN, msg);
     rc = PS5_NET_FILTER_ERR_FW_UNSUPPORTED;
     goto fail;
@@ -1098,7 +940,7 @@ int ps5_net_filter_install(const ps5_net_filter_config_t *cfg) {
   /* Step 2b: Check for external hooks from other payloads             */
   /* ------------------------------------------------------------------ */
 
-  if (is_external_hook_installed(fw_entry)) {
+  if (is_external_hook_installed(fw_offsets)) {
     rc = PS5_NET_FILTER_ERR_EXTERNAL_HOOK;
     goto fail;
   }
@@ -1113,7 +955,7 @@ int ps5_net_filter_install(const ps5_net_filter_config_t *cfg) {
     goto fail;
   }
 
-  uintptr_t sysent_kaddr = (uintptr_t)(kdata_base + fw_entry->sysent_offset);
+  uintptr_t sysent_kaddr = (uintptr_t)(kdata_base + fw_offsets->sysent_off);
 
   if (validate_sysent(sysent_kaddr) != 0) {
     ftp_log_line(FTP_LOG_ERROR,
@@ -1209,8 +1051,8 @@ int ps5_net_filter_install(const ps5_net_filter_config_t *cfg) {
       (resolved_cfg.hook_sendto != 0U) ? original_sendto : 0U;
   shared.zftpd_pid = (int32_t)getpid();
   shared.rule_count = resolved_cfg.rule_count;
-  shared.td_proc_offset = (uint32_t)fw_entry->thread_proc_off;
-  shared.proc_pid_offset = (uint32_t)fw_entry->proc_pid_off;
+  shared.td_proc_offset = PS5_OFF_THREAD_TD_PROC;
+  shared.proc_pid_offset = PS5_OFF_PROC_P_PID;
 
   memcpy(shared.rules, resolved_cfg.rules,
          resolved_cfg.rule_count * sizeof(ps5_net_filter_rule_t));
@@ -1224,6 +1066,18 @@ int ps5_net_filter_install(const ps5_net_filter_config_t *cfg) {
   if (kernel_copyin(g_hook_page_mirror, (intptr_t)g_hook_page_kaddr,
                     HOOK_PAGE_SIZE) != 0) {
     rc = PS5_NET_FILTER_ERR_KWRITE_FAILED;
+    goto fail_free_page;
+  }
+
+  /*
+   * Written first, executable now: W^X means the page must still be writable
+   * while the hook is copied in.  If the flip fails the sysent patch would
+   * jump into a non-executable page, so refuse to install.
+   */
+  if (kernel_clear_pte_nx(g_hook_page_kaddr) != 0) {
+    ftp_log_line(FTP_LOG_ERROR,
+                 "[net_filter] Cannot make the hook page executable; aborting");
+    rc = PS5_NET_FILTER_ERR_KMAP_FAILED;
     goto fail_free_page;
   }
 
@@ -1268,10 +1122,11 @@ int ps5_net_filter_install(const ps5_net_filter_config_t *cfg) {
     char msg[160];
     (void)snprintf(msg, sizeof(msg),
                    "[net_filter] Installed on FW %u.%02u | rules=%u | pid=%d",
-                   fw_version / 100U, fw_version % 100U,
+                   fw_key / 100U, fw_key % 100U,
                    (unsigned)resolved_cfg.rule_count, (int)getpid());
     ftp_log_line(FTP_LOG_INFO, msg);
-    pal_notification_send(msg + 13U); /* skip "[net_filter] " */
+    /* On-screen confirmation, so the install is visible without logs. */
+    pal_notification_send("zftpd: netfilter installed");
   }
 
   return PS5_NET_FILTER_OK;
@@ -1322,15 +1177,15 @@ int ps5_net_filter_uninstall(void) {
 
   int rc = PS5_NET_FILTER_OK;
 
-  /* Detect firmware to recompute sysent addresses */
-  uint32_t fw_version = 0U;
-  const ps5_fw_entry_t *fw_entry = NULL;
+  /* Re-resolve the firmware to recompute the sysent addresses */
+  uint32_t fw_version = kernel_get_fw_version();
+  const ps5_fw_offsets_t *fw_offsets = ps5_fw_offsets_lookup(fw_version);
   uint64_t kdata_base = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
 
-  if ((detect_firmware_version(&fw_version) == 0) &&
-      (lookup_fw_entry(fw_version, &fw_entry) == 0) && (kdata_base != 0U)) {
+  if ((fw_offsets != NULL) && (fw_offsets->sysent_off != 0U) &&
+      (kdata_base != 0U)) {
 
-    uintptr_t sysent_kaddr = (uintptr_t)(kdata_base + fw_entry->sysent_offset);
+    uintptr_t sysent_kaddr = (uintptr_t)(kdata_base + fw_offsets->sysent_off);
 
     uintptr_t connect_slot = sysent_kaddr +
                              (uintptr_t)(SYS_CONNECT * SYSENT_ENTRY_SIZE) +
