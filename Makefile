@@ -346,6 +346,9 @@ SOURCES += src/archive/zip_writer.c
     SOURCES += src/transfer/transfer_manager.c
     SOURCES += src/transfer/transfer_state.c
     SOURCES += src/transfer/dump_job.c
+else
+    # Keep the switch visible in every translation unit either way.
+    CFLAGS += -DENABLE_ZHTTPD=0
 endif
 
 # NFS URL transfers are enabled by default for PS5 zhttp builds. Other targets

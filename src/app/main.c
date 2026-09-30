@@ -49,6 +49,14 @@ SOFTWARE.
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* ZHTTPD (Web File Explorer) is a compile-time switch: default it before any
+ * use in this file, so the non-web builds evaluate it instead of tripping
+ * -Wundef. */
+#ifndef ENABLE_ZHTTPD
+#define ENABLE_ZHTTPD 0
+#endif
+
 #if defined(PLATFORM_PS5) && ENABLE_ZHTTPD
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -100,9 +108,6 @@ static void *net_filter_install_deferred(void *unused) {
 /*---------------------------------------------------------------------------*
  * ZHTTPD (Web File Explorer) — conditional compilation
  *---------------------------------------------------------------------------*/
-#ifndef ENABLE_ZHTTPD
-#define ENABLE_ZHTTPD 0
-#endif
 
 #if ENABLE_ZHTTPD
 #include "event_loop.h"
@@ -178,6 +183,20 @@ static int start_http_thread(pthread_t *thread, event_loop_t *loop) {
 static ftp_server_context_t g_server_ctx;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
+#if defined(PLATFORM_PS5)
+/* Set by the shutdown signals and by the control port a replacing payload
+ * talks to; the PS5 main loop watches the flag with or without the web
+ * interface, so both helpers exist in every PS5 build. */
+static void ps5_signal_shutdown(int sig) {
+  (void)sig;
+  g_shutdown_requested = 1;
+}
+
+void zftpd_shutdown_request(void) {
+  g_shutdown_requested = 1;
+}
+#endif
+
 #if defined(PLATFORM_PS5) && ENABLE_ZHTTPD
 /* Check the actual HTTP request path, not merely whether port 8888 is open:
  * a blocked event-loop callback still accepts TCP connections in the kernel. */
@@ -237,15 +256,6 @@ static void ps5_start_health_watchdog(void) {
 }
 
 static void ps5_shutdown_sequence(void);
-
-static void ps5_signal_shutdown(int sig) {
-  (void)sig;
-  g_shutdown_requested = 1;
-}
-
-void zftpd_shutdown_request(void) {
-  g_shutdown_requested = 1;
-}
 
 #endif
 
