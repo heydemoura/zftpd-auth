@@ -2,6 +2,9 @@
 #include "http_api.h"
 #include "http_api_internal.h"
 #include "ftp_config.h"
+#include "ftp_path.h"
+#include "pal_filesystem.h"
+#include "pal_limits.h"
 #include "pal_fileio.h"
 #include <dirent.h>
 #include <errno.h>
@@ -17,24 +20,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-/**
- * @brief Recursively sum the size of all regular files under a directory.
- *
- * Uses a shared context to enforce:
- *   - Time budget  (DIR_SIZE_TIMEOUT_MS) — bail out after ~200 ms
- *   - Entry limit  (DIR_SIZE_MAX_ENTRIES) — bail after 10 000 stat() calls
- *   - Depth limit  (DIR_SIZE_MAX_DEPTH)   — max 8 levels deep
- *
- * On slow USB/exFAT media with deeply nested trees the scan returns
- * a partial result instead of blocking the HTTP server for seconds.
- *
- *   ┌──────────────────────────────────────────────┐
- *   │  200 ms budget ──► partial=true, ~size       │
- *   │  10 000 entries ──► partial=true, ~size      │
- *   │  depth > 8      ──► skip subtree             │
- *   │  otherwise      ──► full scan, partial=false │
- *   └──────────────────────────────────────────────┘
- */
+/* Directory sizing is bounded so slow removable storage cannot stall HTTP. */
 #define DIR_SIZE_MAX_DEPTH    8
 #define DIR_SIZE_MAX_ENTRIES  10000
 #define DIR_SIZE_TIMEOUT_MS   200
@@ -167,7 +153,7 @@ uint64_t http_api_dir_size_with_partial(const char *path, int *out_partial) {
 static http_response_t *api_list(const http_request_t *request) {
   /* Extract ?path= */
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "/";
+  char path[PAL_PATH_MAX] = "/";
 
   if (query != NULL) {
     (void)http_api_parse_path_param(query, path, sizeof(path));
@@ -203,7 +189,7 @@ static http_response_t *api_list(const http_request_t *request) {
   size_t cap = sizeof(prefix);
 
   pos += (size_t)snprintf(prefix + pos, cap - pos, "{\"path\":\"");
-  (void)http_api_json_escape_append(prefix, cap, &pos, path);
+  (void)http_json_escape_append(prefix, cap, &pos, path);
   pos += (size_t)snprintf(prefix + pos, cap - pos, "\",\"entries\":[");
 
   /* Finalize headers now (adds \r\n after headers) */
@@ -223,7 +209,7 @@ static http_response_t *api_list(const http_request_t *request) {
 
   /* Set up streaming state */
   resp->stream_dir = dir;
-  strncpy(resp->stream_path, path, sizeof(resp->stream_path) - 1);
+  strncpy(resp->stream_path, safe, sizeof(resp->stream_path) - 1);
   resp->stream_path[sizeof(resp->stream_path) - 1] = '\0';
 
   return resp;
@@ -232,7 +218,7 @@ static http_response_t *api_list(const http_request_t *request) {
 
 static http_response_t *api_dirsize(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "/";
+  char path[PAL_PATH_MAX] = "/";
 
   if (query != NULL) {
     (void)http_api_parse_path_param(query, path, sizeof(path));
@@ -256,11 +242,11 @@ static http_response_t *api_dirsize(const http_request_t *request) {
   size_t pos = 0;
   size_t cap = sizeof(body);
 
-  if (http_api_buf_append_cstr(body, cap, &pos, "{\"path\":\"") != 0 ||
-      http_api_json_escape_append(body, cap, &pos, path) != 0 ||
-      http_api_buf_append_cstr(body, cap, &pos, "\",\"size\":") != 0 ||
-      http_api_buf_append_u64(body, cap, &pos, sz) != 0 ||
-      http_api_buf_append_cstr(body, cap, &pos,
+  if (http_buf_append_cstr(body, cap, &pos, "{\"path\":\"") != 0 ||
+      http_json_escape_append(body, cap, &pos, path) != 0 ||
+      http_buf_append_cstr(body, cap, &pos, "\",\"size\":") != 0 ||
+      http_buf_append_u64(body, cap, &pos, sz) != 0 ||
+      http_buf_append_cstr(body, cap, &pos,
                       partial ? ",\"partial\":true}"
                               : ",\"partial\":false}") != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
@@ -275,9 +261,83 @@ static http_response_t *api_dirsize(const http_request_t *request) {
 }
 
 
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
+/** Reads a `key=1` style flag from the query string. */
+static int query_flag(const char *query, const char *key) {
+  char value[8] = {0};
+  if (query == NULL ||
+      http_api_parse_query_param(query, key, value, sizeof(value)) != 0) {
+    return 0;
+  }
+  return (value[0] == '1' || value[0] == 't' || value[0] == 'T' ||
+          value[0] == 'y' || value[0] == 'Y');
+}
+
+/*
+ * Decrypted SELF streaming.
+ *
+ * The VFS node lives on the heap because the body is produced after this
+ * handler returns; the response owns it through stream_close, which
+ * http_response_destroy() calls even when the client disconnects early.
+ */
+typedef struct {
+  vfs_node_t node;
+} self_stream_ctx_t;
+
+static ssize_t self_stream_read(void *ctx, void *buf, size_t len) {
+  self_stream_ctx_t *self = (self_stream_ctx_t *)ctx;
+  if (self == NULL) return -1;
+  return psx_vfs_read(&self->node, buf, len);
+}
+
+static void self_stream_close(void *ctx) {
+  self_stream_ctx_t *self = (self_stream_ctx_t *)ctx;
+  if (self == NULL) return;
+  vfs_close(&self->node);
+  free(self);
+}
+#endif
+
+/* A package installer requests arbitrary byte ranges from the local HTTP URL. */
+static int parse_file_range(const char *header, uint64_t size,
+                            uint64_t *first, uint64_t *last) {
+  if (header == NULL || strncmp(header, "bytes=", 6) != 0 || size == 0) {
+    return -1;
+  }
+  const char *p = header + 6;
+  char *endptr = NULL;
+  errno = 0;
+  if (*p == '-') {
+    uint64_t suffix = strtoull(p + 1, &endptr, 10);
+    if (errno != 0 || endptr == p + 1 || *endptr != '\0' || suffix == 0) {
+      return -1;
+    }
+    *first = suffix >= size ? 0 : size - suffix;
+    *last = size - 1;
+    return 0;
+  }
+  uint64_t start = strtoull(p, &endptr, 10);
+  if (errno != 0 || endptr == p || *endptr != '-' || start >= size) {
+    return -1;
+  }
+  p = endptr + 1;
+  uint64_t finish = size - 1;
+  if (*p != '\0') {
+    errno = 0;
+    finish = strtoull(p, &endptr, 10);
+    if (errno != 0 || endptr == p || *endptr != '\0' || finish < start) {
+      return -1;
+    }
+    if (finish >= size) finish = size - 1;
+  }
+  *first = start;
+  *last = finish;
+  return 0;
+}
+
 static http_response_t *api_download(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "";
+  char path[PAL_PATH_MAX] = "";
 
   if (query != NULL) {
     (void)http_api_parse_path_param(query, path, sizeof(path));
@@ -293,6 +353,62 @@ static http_response_t *api_download(const http_request_t *request) {
                       "Path traversal attempt detected");
   }
 
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
+  /*
+   * SELF decryption is opt-in (?decrypt=1) and only applies to SELF
+   * containers: without the flag, and for every other file, the raw on-disk
+   * bytes are sent exactly as they are stored.
+   */
+  if (query_flag(query, "decrypt") != 0) {
+    self_stream_ctx_t *self = calloc(1U, sizeof(*self));
+    if (self == NULL) {
+      return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                                 "Out of memory");
+    }
+
+    if (psx_vfs_try_open_self(&self->node, safe) == 1) {
+      const char *self_name = strrchr(path, '/');
+      self_name = (self_name != NULL) ? self_name + 1 : path;
+
+      http_response_t *dec = http_response_create(HTTP_STATUS_200_OK);
+      if (dec == NULL) {
+        vfs_close(&self->node);
+        free(self);
+        return NULL;
+      }
+
+      /* Announce the decrypted length: the producer emits raw bytes, so a
+       * chunked header here would desynchronise the response (the console
+       * browser discards it and the client sees an empty transfer). */
+      char dec_len[32];
+      (void)snprintf(dec_len, sizeof(dec_len), "%" PRIu64, self->node.size);
+      http_response_add_header(dec, "Content-Type", "application/octet-stream");
+      http_response_add_header(dec, "Access-Control-Allow-Origin", "*");
+      http_response_add_header(dec, "Content-Length", dec_len);
+      http_response_add_header(dec, "X-Zftpd-Decrypted", "self");
+      char self_disposition[512];
+      (void)snprintf(self_disposition, sizeof(self_disposition),
+                     "attachment; filename=\"%s\"", self_name);
+      http_response_add_header(dec, "Content-Disposition", self_disposition);
+
+      if (http_response_finalize(dec) != 0) {
+        vfs_close(&self->node);
+        free(self);
+        http_response_destroy(dec);
+        return NULL;
+      }
+
+      dec->stream_ctx = self;
+      dec->stream_read = self_stream_read;
+      dec->stream_close = self_stream_close;
+      return dec;
+    }
+
+    /* Not a SELF (parse failed) or unreadable: fall through to raw bytes. */
+    free(self);
+  }
+#endif
+
   /* Open file */
   int fd = open(safe, O_RDONLY);
   if (fd < 0) {
@@ -300,9 +416,31 @@ static http_response_t *api_download(const http_request_t *request) {
   }
 
   struct stat st;
-  if (fstat(fd, &st) < 0 || S_ISDIR(st.st_mode)) {
+  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
     close(fd);
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Not a regular file");
+  }
+
+  uint64_t size = (uint64_t)st.st_size;
+  uint64_t first = 0;
+  uint64_t last = size == 0 ? 0 : size - 1;
+  const char *range = http_get_header(request, "Range");
+  if (range != NULL && parse_file_range(range, size, &first, &last) != 0) {
+    close(fd);
+    http_response_t *invalid =
+        http_response_create(HTTP_STATUS_416_RANGE_NOT_SATISFIABLE);
+    if (invalid == NULL) return NULL;
+    char content_range[80];
+    (void)snprintf(content_range, sizeof(content_range), "bytes */%" PRIu64,
+                   size);
+    http_response_add_header(invalid, "Content-Range", content_range);
+    http_response_add_header(invalid, "Accept-Ranges", "bytes");
+    http_response_add_header(invalid, "Content-Length", "0");
+    if (http_response_finalize(invalid) != 0) {
+      http_response_destroy(invalid);
+      return NULL;
+    }
+    return invalid;
   }
 
   /* Extract basename for Content-Disposition */
@@ -310,7 +448,8 @@ static http_response_t *api_download(const http_request_t *request) {
   basename = (basename != NULL) ? basename + 1 : path;
 
   /* Build response headers */
-  http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  http_response_t *resp = http_response_create(
+      range != NULL ? HTTP_STATUS_206_PARTIAL_CONTENT : HTTP_STATUS_200_OK);
   /*
    * SAFETY: http_response_create() returns NULL when the response pool is
    * exhausted (HTTP_MAX_CONNECTIONS concurrent responses already in flight).
@@ -329,6 +468,14 @@ static http_response_t *api_download(const http_request_t *request) {
   }
   http_response_add_header(resp, "Content-Type", "application/octet-stream");
   http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
+  http_response_add_header(resp, "Accept-Ranges", "bytes");
+  if (range != NULL) {
+    char content_range[96];
+    (void)snprintf(content_range, sizeof(content_range),
+                   "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
+                   first, last, size);
+    http_response_add_header(resp, "Content-Range", content_range);
+  }
 
   char disposition[512];
   snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"",
@@ -336,7 +483,8 @@ static http_response_t *api_download(const http_request_t *request) {
   http_response_add_header(resp, "Content-Disposition", disposition);
 
   char len_str[32];
-  snprintf(len_str, sizeof(len_str), "%lld", (long long)st.st_size);
+  uint64_t response_size = range != NULL ? last - first + 1 : size;
+  snprintf(len_str, sizeof(len_str), "%" PRIu64, response_size);
   http_response_add_header(resp, "Content-Length", len_str);
 
   /*
@@ -353,54 +501,11 @@ static http_response_t *api_download(const http_request_t *request) {
     return NULL;
   }
 
-  /* Store fd so http_server.c can stream the file content */
   resp->sendfile_fd = fd;
-  resp->sendfile_offset = 0;
-  resp->sendfile_count = (size_t)st.st_size;
+  resp->sendfile_offset = (off_t)first;
+  resp->sendfile_count = (size_t)response_size;
 
-  /*
-   * SENDFILE SAFETY CHECK — must happen before http_server.c touches the fd.
-   *
-   * On PS5/PS4 (FreeBSD), calling sendfile(2) on vnodes backed by certain
-   * filesystems causes an IMMEDIATE KERNEL PANIC:
-   *
-   *   exfatfs  — USB drives formatted exFAT: the kernel exFAT vnode does not
-   *               implement vm_pager_ops, so sendfile() dereferences a null
-   *               function pointer.
-   *   msdosfs  — FAT32 USB drives: same broken pager ops.
-   *   nullfs   — bind-mount: inherits the pager of the origin vnode.  If the
-   *               origin is exFAT, the nullfs vnode also KPs.
-   *   pfsmnt   — PlayStation FS mount (/user/av_contents, game data mounts):
-   *               sendfile() sends corrupt/incomplete data.
-   *   pfs      — raw PFS on internal SSD (/data, /user):
-   *               same broken pager as pfsmnt.
-   *
-   * CRITICAL: on these filesystems errno is NEVER set — the kernel triple-
-   * faults before returning to userspace.  Our EINVAL fallback in
-   * pal_sendfile() cannot help because execution never reaches it.
-   *
-   * The fix: detect the filesystem type on the open fd with fstatfs() and set
-   * sendfile_safe = 0.  http_server.c will then use pread()+send_all() for
-   * the entire transfer, bypassing sendfile(2) entirely.
-   *
-   * On Linux and macOS sendfile() is always safe; sendfile_safe = 1.
-   * On FreeBSD/PS5/PS4 default to 0 (unsafe) and only enable for filesystems
-   * known to be safe (ufs, tmpfs, zfs, ffs — internal NVMe on PS5 via
-   * the native FFS layer if ever used).
-   */
-  /*
-   * SENDFILE — zero-copy only, no fallback.
-   *
-   * Linux, macOS, and FreeBSD (including PS4/PS5 OrbisOS) all support
-   * sendfile(2) as a zero-copy kernel-to-NIC DMA path.  The previous
-   * per-filesystem whitelist was overly conservative and forced the
-   * slower pread()+send_all() userspace-copy path for PFS and exFAT
-   * on PS5, causing a 2-3× throughput regression vs v1.4.0.
-   *
-   * If a specific filesystem cannot support sendfile, the transfer
-   * fails — there is no silent degradation to a userspace copy.
-   */
-  resp->sendfile_safe = 1;
+
 
   return resp;
 }
@@ -418,7 +523,7 @@ static http_response_t *api_create_file(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
-  char dir_path[1024] = "/";
+  char dir_path[PAL_PATH_MAX] = "/";
   char name[256];
 
   if (http_api_parse_path_param(query, dir_path, sizeof(dir_path)) != 0) {
@@ -436,14 +541,8 @@ static http_response_t *api_create_file(const http_request_t *request) {
   }
 
   char full[FTP_PATH_MAX];
-  if (strcmp(safe_dir, "/") == 0) {
-    int room = (int)(sizeof(full) - 3 - strlen(name));
-    if (room < 0) room = 0;
-    (void)snprintf(full, sizeof(full), "/%s", name);
-  } else {
-    int room = (int)(sizeof(full) - 2 - strlen(name));
-    if (room < 1) room = 1;
-    (void)snprintf(full, sizeof(full), "%.*s/%s", room, safe_dir, name);
+  if (ftp_path_join(safe_dir, name, full, sizeof(full)) != FTP_OK) {
+    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Path too long");
   }
 
   char safe_full[FTP_PATH_MAX];
@@ -489,7 +588,7 @@ static http_response_t *api_mkdir(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
-  char dir_path[1024] = "/";
+  char dir_path[PAL_PATH_MAX] = "/";
   char name[256];
 
   if (http_api_parse_path_param(query, dir_path, sizeof(dir_path)) != 0) {
@@ -507,14 +606,8 @@ static http_response_t *api_mkdir(const http_request_t *request) {
   }
 
   char full[FTP_PATH_MAX];
-  if (strcmp(safe_dir, "/") == 0) {
-    int room_md = (int)(sizeof(full) - 3 - strlen(name));
-    if (room_md < 0) room_md = 0;
-    (void)snprintf(full, sizeof(full), "/%s", name);
-  } else {
-    int room_md = (int)(sizeof(full) - 2 - strlen(name));
-    if (room_md < 1) room_md = 1;
-    (void)snprintf(full, sizeof(full), "%.*s/%s", room_md, safe_dir, name);
+  if (ftp_path_join(safe_dir, name, full, sizeof(full)) != FTP_OK) {
+    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Path too long");
   }
 
   char safe_full[FTP_PATH_MAX];
@@ -522,10 +615,15 @@ static http_response_t *api_mkdir(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Forbidden path");
   }
 
-  if (mkdir(safe_full, 0777) != 0 && errno != EEXIST) {
-    char msg[128];
-    snprintf(msg, sizeof(msg), "mkdir failed: %s", strerror(errno));
-    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, msg);
+  ftp_error_t mkdir_rc = pal_dir_create(safe_full, 0777);
+  if (mkdir_rc == FTP_ERR_DIR_EXISTS) {
+    struct stat existing;
+    if (lstat(safe_full, &existing) != 0 || !S_ISDIR(existing.st_mode))
+      return http_api_error_json(HTTP_STATUS_409_CONFLICT,
+                                 "Path exists and is not a directory");
+  } else if (mkdir_rc != FTP_OK) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                               "Failed to create directory");
   }
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
@@ -552,13 +650,13 @@ static http_response_t *api_delete(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
-  char path[1024] = "";
+  char path[PAL_PATH_MAX] = "";
   if (http_api_parse_path_param(query, path, sizeof(path)) != 0) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing or invalid path");
   }
 
   char safe[FTP_PATH_MAX];
-  if (!http_api_validate_path(path, safe, sizeof(safe))) {
+  if (!http_api_validate_entry_path(path, safe, sizeof(safe))) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Forbidden path");
   }
 
@@ -568,78 +666,42 @@ static http_response_t *api_delete(const http_request_t *request) {
   }
 
   struct stat st;
-  if (stat(safe, &st) != 0) {
+  if (lstat(safe, &st) != 0) {
     return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Path not found");
   }
 
   ftp_error_t rc;
   if (S_ISDIR(st.st_mode)) {
-    /*
-     * DIRECTORY DELETE
-     *
-     * Standard rmdir(2) fails with ENOTEMPTY if the directory has any
-     * contents — including hidden system files (e.g. PFS metadata on
-     * /data, exFAT recycle-bin entries on USB) that the user cannot see
-     * from a normal listing.  This caused "random" delete failures because
-     * some directories appeared empty in the UI but were not at the kernel
-     * level.
-     *
-     * Strategy:
-     *   1. Try rmdir() first — fast, safe, and correct for truly empty dirs.
-     *   2. If that returns ENOTEMPTY and the caller passed ?recursive=1,
-     *      fall back to pal_dir_remove_recursive() (depth-first unlink tree).
-     *   3. Without ?recursive=1 on a non-empty dir: return 409 Conflict
-     *      with a clear message so the web UI can prompt for confirmation
-     *      rather than silently succeeding or giving a generic 500.
-     *
-     * SAFETY: recursive delete is opt-in — the client must explicitly send
-     * ?recursive=1.  A plain POST /api/delete?path=X on a non-empty dir
-     * returns 409 instead of deleting everything silently.
-     *
-     * @note pal_dir_remove_recursive() is the same depth-first cleanup
-     *       used in the rollback path of pal_copy_cross_device_r_ex, so
-     *       its error handling (unlink failures on locked files, etc.) is
-     *       already well-exercised.
-     */
-    rc = pal_dir_remove(safe); /* try rmdir first */
-
-    if (rc != FTP_OK) {
-      /* Check if the failure was ENOTEMPTY (or our mapped error code) */
-      const char *recursive_flag = strstr(query, "recursive=1");
-      if (recursive_flag != NULL) {
-        /* Caller explicitly requested recursive delete — proceed */
-        rc = pal_dir_remove_recursive_pub(safe);
-        if (rc != FTP_OK) {
+    char recursive[8];
+    int recursive_requested =
+        http_api_parse_query_param(query, "recursive", recursive,
+                                   sizeof(recursive)) == 0 &&
+        strcmp(recursive, "1") == 0;
+    if (recursive_requested) {
+      rc = pal_dir_remove_recursive_pub(safe);
+      if (rc != FTP_OK)
+        return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                                   "Recursive delete failed");
+    } else {
+      rc = pal_dir_remove(safe);
+      if (rc != FTP_OK) {
+        if (errno == ENOTEMPTY || errno == EEXIST)
           return http_api_error_json(
-              HTTP_STATUS_500_INTERNAL_ERROR,
-              "Recursive delete failed (permission denied or I/O error)");
-        }
-      } else {
-        /*
-         * Return 409 Conflict — the directory is not empty and the
-         * caller did not ask for recursive deletion.
-         *
-         * The web UI should catch this and either:
-         *   (a) Show a confirmation dialog ("Delete all contents?") then
-         *       retry with ?recursive=1, or
-         *   (b) Tell the user to empty the folder first.
-         */
-        return http_api_error_json(HTTP_STATUS_409_CONFLICT,
-                          "Directory is not empty. Use recursive=1 to force.");
+              HTTP_STATUS_409_CONFLICT,
+              "Directory is not empty. Use recursive=1 to force.");
+        return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                                   "Failed to remove directory");
       }
     }
   } else {
     rc = pal_file_delete(safe);
-    if (rc != FTP_OK) {
+    if (rc != FTP_OK)
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
-                        "Failed to delete file");
-    }
+                                 "Failed to delete file");
   }
 
-  /* POST-DELETE VERIFICATION: Ensure the path was actually deleted */
   struct stat verify_st;
-  if (stat(safe, &verify_st) == 0) {
-    /* Path still exists — delete operation failed silently */
+  if (lstat(safe, &verify_st) == 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
                       "Delete operation failed: path still exists (permission "
                       "denied or I/O error)");
@@ -665,7 +727,7 @@ static http_response_t *api_rename(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
-  char path[1024] = "";
+  char path[PAL_PATH_MAX] = "";
   char name[256];
   if (http_api_parse_path_param(query, path, sizeof(path)) != 0) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing or invalid path");
@@ -679,7 +741,7 @@ static http_response_t *api_rename(const http_request_t *request) {
 
   /* Validate old path */
   char safe_old[FTP_PATH_MAX];
-  if (!http_api_validate_path(path, safe_old, sizeof(safe_old))) {
+  if (!http_api_validate_entry_path(path, safe_old, sizeof(safe_old))) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Forbidden path");
   }
 
@@ -694,29 +756,14 @@ static http_response_t *api_rename(const http_request_t *request) {
    *   /data/files/old.txt  ->  /data/files/  (parent)
    *   parent + "new.txt"   ->  /data/files/new.txt
    */
+  char parent[FTP_PATH_MAX];
   char new_path[FTP_PATH_MAX];
-  const char *last_slash = strrchr(safe_old, '/');
-  if (last_slash == NULL) {
-    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Internal path error");
-  }
-  size_t parent_len = (size_t)(last_slash - safe_old);
-  if (parent_len == 0U) {
-    /* file is directly under root "/" */
-    int room_rn = (int)(sizeof(new_path) - 3 - strlen(name));
-    if (room_rn < 0) room_rn = 0;
-    (void)snprintf(new_path, sizeof(new_path), "/%s", name);
-  } else {
-    int room_rn = (int)(sizeof(new_path) - 2 - strlen(name));
-    int actual = (int)parent_len;
-    if (room_rn < 1) room_rn = 1;
-    if (actual > room_rn) actual = room_rn;
-    (void)snprintf(new_path, sizeof(new_path), "%.*s/%s", actual,
-                   safe_old, name);
-  }
+  if (ftp_path_dirname(safe_old, parent, sizeof(parent)) != FTP_OK ||
+      ftp_path_join(parent, name, new_path, sizeof(new_path)) != FTP_OK)
+    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Path too long");
 
-  /* Validate new path stays within root */
   char safe_new[FTP_PATH_MAX];
-  if (!http_api_validate_path(new_path, safe_new, sizeof(safe_new))) {
+  if (!http_api_validate_entry_path(new_path, safe_new, sizeof(safe_new))) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Destination forbidden");
   }
 
@@ -857,27 +904,13 @@ static http_response_t *api_copy_pause(const http_request_t *request) {
   return resp;
 }
 
-/*===========================================================================*
- * POST /api/copy — Server-side file/directory copy
- *
- *   ┌──────────────────────────────────────────────────────┐
- *   │  POST /api/copy?path=/src/file&dst=/dest/folder      │
- *   │                                                      │
- *   │  src  = http_api_validate_path(path)                          │
- *   │  dst  = http_api_validate_path(dst) + '/' + basename(src)     │
- *   │  pal_file_copy_recursive_ex(src, dst, keep_src=1)    │
- *   │  result -> {"ok":true}                               │
- *   └──────────────────────────────────────────────────────┘
- *===========================================================================*/
-
-
+/* Server-side copy runs asynchronously and reports progress separately. */
 static http_response_t *api_copy(const http_request_t *request) {
   if (request->method != HTTP_METHOD_POST) {
     return http_api_error_json(HTTP_STATUS_405_METHOD_NOT_ALLOWED,
                       "Use POST for this endpoint");
   }
 
-  /* Reject if a copy is already in progress */
   if (atomic_load(&g_copy_progress.active) != 0) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
                       "A copy operation is already in progress");
@@ -888,8 +921,8 @@ static http_response_t *api_copy(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
-  char src_path[1024] = "";
-  char dst_dir[1024] = "";
+  char src_path[PAL_PATH_MAX] = "";
+  char dst_dir[PAL_PATH_MAX] = "";
   if (http_api_parse_path_param(query, src_path, sizeof(src_path)) != 0) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing or invalid path");
   }
@@ -900,7 +933,7 @@ static http_response_t *api_copy(const http_request_t *request) {
 
   /* Validate source */
   char safe_src[FTP_PATH_MAX];
-  if (!http_api_validate_path(src_path, safe_src, sizeof(safe_src))) {
+  if (!http_api_validate_entry_path(src_path, safe_src, sizeof(safe_src))) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Source path forbidden");
   }
   if (pal_path_exists(safe_src) != 1) {
@@ -946,7 +979,7 @@ static http_response_t *api_copy(const http_request_t *request) {
 
   /* Re-validate the composed destination */
   char safe_final[FTP_PATH_MAX];
-  if (!http_api_validate_path(full_dst, safe_final, sizeof(safe_final))) {
+  if (!http_api_validate_entry_path(full_dst, safe_final, sizeof(safe_final))) {
     return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Final destination forbidden");
   }
 

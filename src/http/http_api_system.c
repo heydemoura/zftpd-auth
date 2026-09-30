@@ -2,10 +2,15 @@
 #include "http_api.h"
 #include "http_api_internal.h"
 #include "ftp_config.h"
+#include "pal_limits.h"
 #include "ftp_instance.h"
 #include "ftp_server.h"
+#include "pal_disc.h"
+#include "pal_dns_filter.h"
+#include "pal_filesystem.h"
 #include "pal_network.h"
 #include "pal_notification.h"
+#include "pal_volume.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -17,6 +22,12 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#if defined(PLATFORM_PS5)
+#include <ps5/kernel.h> /* kernel r/w primitives, pager diagnostics */
+#endif
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5) || defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -460,7 +471,7 @@ static int get_ram_stats(uint64_t *used, uint64_t *cached, uint64_t *buffers,
 
 static http_response_t *api_stats(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "/";
+  char path[PAL_PATH_MAX] = "/";
 
   if (query != NULL) {
     (void)http_api_parse_path_param(query, path, sizeof(path));
@@ -491,31 +502,31 @@ static http_response_t *api_stats(const http_request_t *request) {
   size_t pos = 0U;
   size_t cap = sizeof(body);
 
-  if (http_api_buf_append_cstr(body, cap, &pos, "{\"path\":\"") != 0) {
+  if (http_buf_append_cstr(body, cap, &pos, "{\"path\":\"") != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
   }
-  if (http_api_json_escape_append(body, cap, &pos, path) != 0) {
+  if (http_json_escape_append(body, cap, &pos, path) != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
   }
-  if (http_api_buf_append_cstr(body, cap, &pos, "\"") != 0) {
+  if (http_buf_append_cstr(body, cap, &pos, "\"") != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
   }
 
   if (disk_ok == 0) {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"disk_used\":") != 0 ||
-        http_api_buf_append_u64(body, cap, &pos, disk_used) != 0 ||
-        http_api_buf_append_cstr(body, cap, &pos, ",\"disk_total\":") != 0 ||
-        http_api_buf_append_u64(body, cap, &pos, disk_total) != 0 ||
-        http_api_buf_append_cstr(body, cap, &pos, ",\"disk_free\":") != 0 ||
-        http_api_buf_append_u64(body, cap, &pos, disk_free) != 0 ||
-        http_api_buf_append_cstr(body, cap, &pos, ",\"disk_path\":\"") != 0 ||
-        http_api_json_escape_append(body, cap, &pos,
+    if (http_buf_append_cstr(body, cap, &pos, ",\"disk_used\":") != 0 ||
+        http_buf_append_u64(body, cap, &pos, disk_used) != 0 ||
+        http_buf_append_cstr(body, cap, &pos, ",\"disk_total\":") != 0 ||
+        http_buf_append_u64(body, cap, &pos, disk_total) != 0 ||
+        http_buf_append_cstr(body, cap, &pos, ",\"disk_free\":") != 0 ||
+        http_buf_append_u64(body, cap, &pos, disk_free) != 0 ||
+        http_buf_append_cstr(body, cap, &pos, ",\"disk_path\":\"") != 0 ||
+        http_json_escape_append(body, cap, &pos,
                            (disk_path != NULL) ? disk_path : "") != 0 ||
-        http_api_buf_append_cstr(body, cap, &pos, "\"") != 0) {
+        http_buf_append_cstr(body, cap, &pos, "\"") != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   } else {
-    if (http_api_buf_append_cstr(body, cap, &pos,
+    if (http_buf_append_cstr(body, cap, &pos,
                         ",\"disk_used\":null,\"disk_total\":null,"
                         "\"disk_free\":null,\"disk_path\":null") != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
@@ -523,39 +534,39 @@ static http_response_t *api_stats(const http_request_t *request) {
   }
 
   if (temp_ok == 0) {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"cpu_temp\":") != 0 ||
-        http_api_buf_append_i32(body, cap, &pos, temp_c) != 0) {
+    if (http_buf_append_cstr(body, cap, &pos, ",\"cpu_temp\":") != 0 ||
+        http_buf_append_i32(body, cap, &pos, temp_c) != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   } else {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"cpu_temp\":null") != 0) {
+    if (http_buf_append_cstr(body, cap, &pos, ",\"cpu_temp\":null") != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   }
 
   if (boot_ok == 0) {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"uptime\":") != 0 ||
-        http_api_buf_append_u64(body, cap, &pos, boot_epoch) != 0) {
+    if (http_buf_append_cstr(body, cap, &pos, ",\"uptime\":") != 0 ||
+        http_buf_append_u64(body, cap, &pos, boot_epoch) != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   } else {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"uptime\":null") != 0) {
+    if (http_buf_append_cstr(body, cap, &pos, ",\"uptime\":null") != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   }
 
   if (items_ok == 0) {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"items_in_dir\":") != 0 ||
-        http_api_buf_append_u32(body, cap, &pos, items) != 0) {
+    if (http_buf_append_cstr(body, cap, &pos, ",\"items_in_dir\":") != 0 ||
+        http_buf_append_u32(body, cap, &pos, items) != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   } else {
-    if (http_api_buf_append_cstr(body, cap, &pos, ",\"items_in_dir\":null") != 0) {
+    if (http_buf_append_cstr(body, cap, &pos, ",\"items_in_dir\":null") != 0) {
       return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
     }
   }
 
-  if (http_api_buf_append_cstr(body, cap, &pos, "}") != 0) {
+  if (http_buf_append_cstr(body, cap, &pos, "}") != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
   }
 
@@ -643,13 +654,20 @@ static http_response_t *api_status(const http_request_t *request) {
   char body[320];
   size_t pos = 0;
   size_t cap = sizeof(body);
+#if defined(PLATFORM_PS5)
+  const char *platform = "ps5";
+#elif defined(PLATFORM_PS4)
+  const char *platform = "ps4";
+#else
+  const char *platform = "host";
+#endif
 
   pos += (size_t)snprintf(
       body + pos, cap - pos,
       "{\"ok\":true,\"version\":\"%s\",\"instance_id\":\"%016llx\","
-      "\"start_monotonic_ns\":%" PRIu64 ",\"pid\":%d}",
+      "\"start_monotonic_ns\":%" PRIu64 ",\"pid\":%d,\"platform\":\"%s\"}",
       RELEASE_VERSION, (unsigned long long)instance_id, start_ns,
-      (int)getpid());
+      (int)getpid(), platform);
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
   http_response_add_header(resp, "Content-Type", "application/json");
@@ -718,11 +736,11 @@ static http_response_t *api_notify(const http_request_t *request) {
   size_t pos = 0;
   size_t cap = sizeof(body);
 
-  if (http_api_buf_append_cstr(body, cap, &pos, "{\"ok\":true,\"text\":\"") != 0 ||
-      http_api_json_escape_append(body, cap, &pos, text) != 0 ||
-      http_api_buf_append_cstr(body, cap, &pos, "\",\"icon\":\"") != 0 ||
-      http_api_json_escape_append(body, cap, &pos, icon) != 0 ||
-      http_api_buf_append_cstr(body, cap, &pos, "\"}") != 0) {
+  if (http_buf_append_cstr(body, cap, &pos, "{\"ok\":true,\"text\":\"") != 0 ||
+      http_json_escape_append(body, cap, &pos, text) != 0 ||
+      http_buf_append_cstr(body, cap, &pos, "\",\"icon\":\"") != 0 ||
+      http_json_escape_append(body, cap, &pos, icon) != 0 ||
+      http_buf_append_cstr(body, cap, &pos, "\"}") != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
   }
 
@@ -749,7 +767,7 @@ static http_response_t *api_disk_info(const http_request_t *request) {
                           "{\"used\":%" PRIu64 ",\"free\":%" PRIu64
                           ",\"total\":%" PRIu64 ",\"path\":\"",
                           used, free_b, total);
-  (void)http_api_json_escape_append(body, cap, &pos, disk_path ? disk_path : "/");
+  (void)http_json_escape_append(body, cap, &pos, disk_path ? disk_path : "/");
   pos += (size_t)snprintf(body + pos, cap - pos, "\"}");
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
@@ -762,7 +780,7 @@ static http_response_t *api_disk_info(const http_request_t *request) {
 
 static http_response_t *api_disk_tree(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "/";
+  char path[PAL_PATH_MAX] = "/";
   if (query != NULL) {
     (void)http_api_parse_path_param(query, path, sizeof(path));
   }
@@ -792,7 +810,7 @@ static http_response_t *api_disk_tree(const http_request_t *request) {
   dirname = (dirname && dirname[1] != '\0') ? dirname + 1 : safe;
 
   pos += (size_t)snprintf(body + pos, cap - pos, "{\"name\":\"");
-  (void)http_api_json_escape_append(body, cap, &pos, dirname);
+  (void)http_json_escape_append(body, cap, &pos, dirname);
   pos += (size_t)snprintf(body + pos, cap - pos,
                           "\",\"type\":\"directory\",\"children\":[");
 
@@ -852,7 +870,7 @@ static http_response_t *api_disk_tree(const http_request_t *request) {
     /* Append child entry */
     size_t name_start = pos;
     pos += (size_t)snprintf(body + pos, cap - pos, "{\"name\":\"");
-    (void)http_api_json_escape_append(body, cap, &pos, ent->d_name);
+    (void)http_json_escape_append(body, cap, &pos, ent->d_name);
     pos +=
         (size_t)snprintf(body + pos, cap - pos,
                          "\",\"type\":\"%s\",\"size\":%" PRIu64 "}", type, sz);
@@ -982,6 +1000,293 @@ static http_response_t *api_admin_fan(const http_request_t *request) {
   return resp;
 }
 
+/**
+ * @brief Is a filesystem actually mounted on @p path?
+ *
+ * The console creates the volume directories (/mnt/usb0 … /mnt/usb7, /mnt/ext0)
+ * whether or not a device is attached, so the directory name alone proves
+ * nothing.  A mounted volume is a different filesystem from the directory that
+ * holds its mountpoint, which stat() exposes as a different st_dev — the
+ * portable check, no ioctl or psdevwiki-specific syscall needed.
+ */
+static int mount_is_active(const char *path, uint64_t *total,
+                           uint64_t *free_bytes) {
+  char parent[FTP_PATH_MAX];
+  if (snprintf(parent, sizeof(parent), "%s", path) <= 0) return 0;
+
+  char *slash = strrchr(parent, '/');
+  if (slash == NULL || slash == parent) return 0;
+  *slash = '\0';
+
+  struct stat mount_st;
+  struct stat parent_st;
+  if (stat(path, &mount_st) != 0 || !S_ISDIR(mount_st.st_mode)) return 0;
+  if (stat(parent, &parent_st) != 0) return 0;
+  if (mount_st.st_dev == parent_st.st_dev) return 0; /* plain directory */
+
+  if (total != NULL || free_bytes != NULL) {
+    struct statvfs vfs;
+    memset(&vfs, 0, sizeof(vfs));
+    uint64_t tot = 0U, avail = 0U;
+    if (statvfs(path, &vfs) == 0) {
+      tot = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+      avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+    }
+    if (total != NULL) *total = tot;
+    if (free_bytes != NULL) *free_bytes = avail;
+  }
+  return 1;
+}
+
+/**
+ * @brief Volume label of the filesystem mounted on @p path.
+ *
+ * Label lookup for a mounted volume. Kept as the single place the interface
+ * asks for it, so a platform that does expose the device node only has to
+ * change this function.
+ * name, which still identifies the stick better than the mountpoint slot.
+ */
+static void mount_device_label(const char *path, char *label, size_t label_size,
+                               char *device, size_t device_size,
+                               char *source, size_t source_size) {
+  (void)path;
+  /* Reading a volume label needs the mounted-from device, which this platform
+   * does not expose to a payload: the fields stay empty and the interface
+   * names removable volumes by their position instead. */
+  if (label != NULL && label_size > 0U) label[0] = '\0';
+  if (device != NULL && device_size > 0U) device[0] = '\0';
+  if (source != NULL && source_size > 0U) {
+    (void)snprintf(source, source_size, "not exposed on this platform");
+  }
+}
+
+/**
+ * @brief Report the removable volumes really connected (GET /api/mounts).
+ *
+ * The file manager builds its Places list from this, so an empty card reader
+ * no longer shows up as a drive.
+ */
+static http_response_t *api_mounts(const http_request_t *request) {
+  (void)request;
+
+  static const struct {
+    const char *name;
+    const char *kind;
+  } candidates[] = {{"usb0", "usb"}, {"usb1", "usb"}, {"usb2", "usb"},
+                    {"usb3", "usb"}, {"usb4", "usb"}, {"usb5", "usb"},
+                    {"usb6", "usb"}, {"usb7", "usb"}, {"ext0", "ext"},
+                    {"ext1", "ext"}};
+
+  http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  if (resp == NULL) return NULL;
+  http_response_add_header(resp, "Content-Type", "application/json");
+  http_response_add_header(resp, "Cache-Control", "no-store");
+
+  char body[4096];
+  size_t pos = 0U;
+  int first = 1;
+  if (http_buf_append_cstr(body, sizeof(body), &pos, "{\"ok\":true,\"mounts\":[") != 0) {
+    http_response_destroy(resp);
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "OOM");
+  }
+
+  for (size_t i = 0U; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    char path[64];
+    (void)snprintf(path, sizeof(path), "/mnt/%s", candidates[i].name);
+
+    uint64_t total = 0U, avail = 0U;
+    if (mount_is_active(path, &total, &avail) == 0) continue;
+
+    char label[64];
+    char device[128];
+    char label_source[160];
+    mount_device_label(path, label, sizeof(label), device, sizeof(device),
+                       label_source, sizeof(label_source));
+
+    char item[640];
+    int len = snprintf(item, sizeof(item),
+                       "%s{\"path\":\"/mnt/%s\",\"name\":\"%s\",\"kind\":\"%s\","
+                       "\"label\":\"%s\",\"label_source\":\"%s\","
+                       "\"device\":\"%s\","
+                       "\"total\":%" PRIu64 ",\"free\":%" PRIu64 "}",
+                       first ? "" : ",", candidates[i].name, candidates[i].name,
+                       candidates[i].kind, label, label_source,
+                       device, total, avail);
+    if (len < 0 || (size_t)len >= sizeof(item) ||
+        http_buf_append_cstr(body, sizeof(body), &pos, item) != 0) {
+      http_response_destroy(resp);
+      return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                                 "Mounts response too large");
+    }
+    first = 0;
+  }
+
+  if (http_buf_append_cstr(body, sizeof(body), &pos, "]}") != 0) {
+    http_response_destroy(resp);
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "OOM");
+  }
+
+  http_response_set_body(resp, body, pos);
+  return resp;
+}
+
+/**
+ * @brief Kernel r/w and pager sanity (GET /api/debug/kernel, PS5 only).
+ *
+ * The decrypting read path swaps a pager ops pointer through the SDK's kernel
+ * write primitive.  When that primitive silently fails the mapping returns
+ * zeroed pages, which looks exactly like "the dump is empty", so this endpoint
+ * reports the values involved plus a write-back test that changes nothing:
+ * it writes back the very value it just read.
+ */
+static http_response_t *api_debug_kernel(const http_request_t *request) {
+  (void)request;
+
+  http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  if (resp == NULL) return NULL;
+  http_response_add_header(resp, "Content-Type", "application/json");
+  http_response_add_header(resp, "Cache-Control", "no-store");
+
+  char body[768];
+#if defined(PLATFORM_PS5)
+  uintptr_t table = 0U, ops_vnode = 0U, ops_self = 0U;
+  psx_pager_debug(&table, &ops_vnode, &ops_self);
+
+  uint32_t fw = kernel_get_fw_version();
+  uintptr_t kproc = (uintptr_t)kernel_get_proc(getpid());
+
+  int write_back_rc = -99;
+  uint64_t before = 0U, after = 0U;
+  if (table != 0U) {
+    before = (uint64_t)kernel_getlong((intptr_t)(table + 2U * 8U));
+    write_back_rc = kernel_setlong((intptr_t)(table + 2U * 8U), before);
+    after = (uint64_t)kernel_getlong((intptr_t)(table + 2U * 8U));
+  }
+
+  int len = snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"fw\":\"0x%08X\",\"kdata\":\"0x%llX\","
+                     "\"allproc\":\"0x%llX\",\"kproc_self\":\"0x%llX\","
+                     "\"pager_table\":\"0x%llX\",\"ops_vnode\":\"0x%llX\","
+                     "\"ops_self\":\"0x%llX\",\"write_back_rc\":%d,"
+                     "\"slot_before\":\"0x%llX\",\"slot_after\":\"0x%llX\"}",
+                     fw, (unsigned long long)KERNEL_ADDRESS_DATA_BASE,
+                     (unsigned long long)KERNEL_ADDRESS_ALLPROC,
+                     (unsigned long long)kproc, (unsigned long long)table,
+                     (unsigned long long)ops_vnode, (unsigned long long)ops_self,
+                     write_back_rc, (unsigned long long)before,
+                     (unsigned long long)after);
+#else
+  int len = snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"message\":\"PS5 only\"}");
+#endif
+  http_response_set_body(resp, body, (size_t)len);
+  return resp;
+}
+
+/** @brief DNS filter state (GET /api/dns/status). */
+static http_response_t *api_dns_status(const http_request_t *request) {
+  if (request == NULL) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Null request");
+  }
+  if (request->method != HTTP_METHOD_GET) {
+    return http_api_error_json(HTTP_STATUS_405_METHOD_NOT_ALLOWED,
+                               "Use GET /api/dns/status");
+  }
+
+  http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  if (resp == NULL) {
+    return NULL;
+  }
+  http_response_add_header(resp, "Content-Type", "application/json");
+  http_response_add_header(resp, "Cache-Control", "no-store");
+
+  char body[256];
+  int len = snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"running\":%s,\"enabled\":%s,\"resolver\":%s,"
+                     "\"masks\":%zu,\"exceptions\":%zu}",
+                     pal_dns_filter_running() ? "true" : "false",
+                     pal_dns_filter_enabled() ? "true" : "false",
+                     pal_dns_filter_other_resolver_present() ? "true" : "false",
+                     pal_dns_filter_mask_count(),
+                     pal_dns_filter_exception_count());
+  http_response_set_body(resp, body, (size_t)len);
+  return resp;
+}
+
+/**
+ * @brief Enable or disable the DNS filter (POST /api/dns/enable|disable).
+ *
+ * The choice is persisted, so it survives a payload reinjection.
+ */
+static http_response_t *api_dns_set(const http_request_t *request, int enable) {
+  if (request == NULL) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Null request");
+  }
+  if (request->method != HTTP_METHOD_POST) {
+    return http_api_error_json(HTTP_STATUS_405_METHOD_NOT_ALLOWED,
+                               enable ? "Use POST /api/dns/enable"
+                                      : "Use POST /api/dns/disable");
+  }
+
+  int rc = pal_dns_filter_set_enabled(enable != 0);
+  if (rc == 0) {
+    pal_notification_send(enable ? "zftpd: DNS filter active"
+                                 : "zftpd: DNS filter disabled");
+  }
+
+  return http_api_status_json_200(rc == 0 ? 1 : 0,
+                                  enable ? "DNS filter enabled"
+                                         : "DNS filter disabled",
+                                  rc);
+}
+
+/**
+ * @brief Eject the console's Blu-ray disc (POST /api/system/eject).
+ *
+ * Maps the driver errno to a message the user can act on: a Digital Edition
+ * console has no drive node, a disc game keeps the drive busy, and without the
+ * kernel exploit the device is not accessible.
+ */
+static http_response_t *api_disc_eject(const http_request_t *request) {
+  if (request == NULL) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Null request");
+  }
+  if (request->method != HTTP_METHOD_POST) {
+    return http_api_error_json(HTTP_STATUS_405_METHOD_NOT_ALLOWED,
+                               "Use POST /api/system/eject");
+  }
+
+  int rc = pal_disc_eject();
+  if (rc == 0) {
+    pal_notification_send("zftpd: Blu-ray disc ejected");
+  }
+  return http_api_status_json_200(rc == 0 ? 1 : 0, pal_disc_reason(rc), rc);
+}
+
+/** @brief Report whether the console has an optical drive (GET). */
+static http_response_t *api_disc_state(const http_request_t *request) {
+  if (request == NULL) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Null request");
+  }
+  if (request->method != HTTP_METHOD_GET) {
+    return http_api_error_json(HTTP_STATUS_405_METHOD_NOT_ALLOWED,
+                               "Use GET /api/system/disc");
+  }
+
+  http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  if (resp == NULL) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "OOM");
+  }
+  http_response_add_header(resp, "Content-Type", "application/json");
+  http_response_add_header(resp, "Cache-Control", "no-store");
+
+  char body[64];
+  int len = snprintf(body, sizeof(body), "{\"ok\":true,\"present\":%s}",
+                     pal_disc_present() != 0 ? "true" : "false");
+  http_response_set_body(resp, body, (size_t)len);
+  return resp;
+}
+
 http_response_t *http_api_system_handle(const http_request_t *request) {
   if (request == NULL) return NULL;
   if (http_api_route_is(request->uri, "/api/stats/ram")) return api_stats_ram(request);
@@ -992,6 +1297,13 @@ http_response_t *http_api_system_handle(const http_request_t *request) {
   if (http_api_route_is(request->uri, "/api/disk/info")) return api_disk_info(request);
   if (http_api_route_is(request->uri, "/api/disk/tree")) return api_disk_tree(request);
   if (http_api_route_is(request->uri, "/api/network/reset")) return api_network_reset(request);
+  if (http_api_route_is(request->uri, "/api/mounts")) return api_mounts(request);
+  if (http_api_route_is(request->uri, "/api/debug/kernel")) return api_debug_kernel(request);
+  if (http_api_route_is(request->uri, "/api/dns/status")) return api_dns_status(request);
+  if (http_api_route_is(request->uri, "/api/dns/enable")) return api_dns_set(request, 1);
+  if (http_api_route_is(request->uri, "/api/dns/disable")) return api_dns_set(request, 0);
+  if (http_api_route_is(request->uri, "/api/system/eject")) return api_disc_eject(request);
+  if (http_api_route_is(request->uri, "/api/system/disc")) return api_disc_state(request);
   if (http_api_route_is(request->uri, "/api/admin/fan")) return api_admin_fan(request);
   return NULL;
 }

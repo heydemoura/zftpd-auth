@@ -66,10 +66,52 @@ int main(void) {
   CHECK(resp->sendfile_count == 5U);
   http_response_destroy(resp);
 
+  http_request_t range_req;
+  memset(&range_req, 0, sizeof(range_req));
+  range_req.method = HTTP_METHOD_GET;
+  (void)snprintf(range_req.uri, sizeof(range_req.uri), "%s", uri);
+  char range_header[] = "Range";
+  char middle[] = "bytes=1-3";
+  range_req.headers[0] = (http_header_t){range_header, middle};
+  range_req.num_headers = 1;
+  resp = http_api_files_handle(&range_req);
+  CHECK(response_is(resp, 206));
+  CHECK(strstr(resp->data, "Content-Range: bytes 1-3/5\r\n") != NULL);
+  CHECK(strstr(resp->data, "Content-Length: 3\r\n") != NULL);
+  CHECK(resp->sendfile_offset == 1 && resp->sendfile_count == 3U);
+  http_response_destroy(resp);
+
+  char suffix[] = "bytes=-2";
+  range_req.headers[0].value = suffix;
+  resp = http_api_files_handle(&range_req);
+  CHECK(response_is(resp, 206));
+  CHECK(resp->sendfile_offset == 3 && resp->sendfile_count == 2U);
+  http_response_destroy(resp);
+
+  char beyond[] = "bytes=5-";
+  range_req.headers[0].value = beyond;
+  resp = http_api_files_handle(&range_req);
+  CHECK(response_is(resp, 416));
+  CHECK(strstr(resp->data, "Content-Range: bytes */5\r\n") != NULL);
+  http_response_destroy(resp);
+
   resp = request(HTTP_METHOD_GET, "/api/listing?path=/", NULL);
   CHECK(resp == NULL);
   resp = request(HTTP_METHOD_GET, "/api/download/start", NULL);
   CHECK(resp == NULL);
+  http_request_t transfer_req;
+  memset(&transfer_req, 0, sizeof(transfer_req));
+  transfer_req.method = HTTP_METHOD_GET;
+  (void)snprintf(transfer_req.uri, sizeof(transfer_req.uri),
+                 "/api/download/delete");
+  resp = http_api_transfer_handle(&transfer_req);
+  CHECK(response_is(resp, 405));
+  http_response_destroy(resp);
+  (void)snprintf(transfer_req.uri, sizeof(transfer_req.uri),
+                 "/api/download/retry");
+  resp = http_api_transfer_handle(&transfer_req);
+  CHECK(response_is(resp, 405));
+  http_response_destroy(resp);
 
   (void)snprintf(uri, sizeof(uri), "/api/mkdir?path=%s&name=sub", root);
   resp = request(HTTP_METHOD_POST, uri, NULL);
@@ -80,6 +122,15 @@ int main(void) {
   (void)snprintf(sub, sizeof(sub), "%s/sub", root);
   struct stat st;
   CHECK(stat(sub, &st) == 0 && S_ISDIR(st.st_mode));
+
+  char collision[1024];
+  (void)snprintf(collision, sizeof(collision), "%s/collision", root);
+  CHECK(write_text(collision, "file") == 0);
+  (void)snprintf(uri, sizeof(uri), "/api/mkdir?path=%s&name=collision", root);
+  resp = request(HTTP_METHOD_POST, uri, NULL);
+  CHECK(response_is(resp, 409));
+  http_response_destroy(resp);
+  CHECK(lstat(collision, &st) == 0 && S_ISREG(st.st_mode));
 
   (void)snprintf(uri, sizeof(uri),
                  "/api/create_file?path=%s&name=data.txt", sub);
@@ -114,6 +165,36 @@ int main(void) {
   http_response_destroy(resp);
   CHECK(stat(sub, &st) != 0);
 
+  char guarddir[1024], guardfile[1024];
+  (void)snprintf(guarddir, sizeof(guarddir), "%s/guard", root);
+  (void)snprintf(guardfile, sizeof(guardfile), "%s/keep.txt", guarddir);
+  CHECK(mkdir(guarddir, 0700) == 0);
+  CHECK(write_text(guardfile, "keep") == 0);
+  (void)snprintf(uri, sizeof(uri), "/api/delete?path=%s&notrecursive=1", guarddir);
+  resp = request(HTTP_METHOD_POST, uri, NULL);
+  CHECK(response_is(resp, 409));
+  http_response_destroy(resp);
+  CHECK(lstat(guardfile, &st) == 0);
+  (void)snprintf(uri, sizeof(uri), "/api/delete?path=%s&recursive=10", guarddir);
+  resp = request(HTTP_METHOD_POST, uri, NULL);
+  CHECK(response_is(resp, 409));
+  http_response_destroy(resp);
+  CHECK(lstat(guardfile, &st) == 0);
+
+  char targetdir[1024], targetfile[1024], dirlink[1024];
+  (void)snprintf(targetdir, sizeof(targetdir), "%s/targetdir", root);
+  (void)snprintf(targetfile, sizeof(targetfile), "%s/keep.txt", targetdir);
+  (void)snprintf(dirlink, sizeof(dirlink), "%s/dirlink", root);
+  CHECK(mkdir(targetdir, 0700) == 0);
+  CHECK(write_text(targetfile, "target") == 0);
+  CHECK(symlink(targetdir, dirlink) == 0);
+  (void)snprintf(uri, sizeof(uri), "/api/delete?path=%s", dirlink);
+  resp = request(HTTP_METHOD_POST, uri, NULL);
+  CHECK(response_is(resp, 200));
+  http_response_destroy(resp);
+  CHECK(lstat(dirlink, &st) != 0 && errno == ENOENT);
+  CHECK(lstat(targetfile, &st) == 0 && S_ISREG(st.st_mode));
+
   (void)snprintf(uri, sizeof(uri), "/api/mkdir?path=%s&name=copydst", root);
   resp = request(HTTP_METHOD_POST, uri, NULL);
   CHECK(response_is(resp, 200));
@@ -138,6 +219,11 @@ int main(void) {
   CHECK(response_is(resp, 200));
   http_response_destroy(resp);
 
+  CHECK(unlink(collision) == 0);
+  CHECK(unlink(guardfile) == 0);
+  CHECK(rmdir(guarddir) == 0);
+  CHECK(unlink(targetfile) == 0);
+  CHECK(rmdir(targetdir) == 0);
   CHECK(unlink(hello) == 0);
   CHECK(rmdir(root) == 0);
   http_api_set_root("/");

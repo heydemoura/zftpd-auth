@@ -57,33 +57,24 @@ SOFTWARE.
 /* Server configuration */
 #define HTTP_DEFAULT_PORT 8888
 #define HTTP_MAX_CONNECTIONS 100
-#define HTTP_REQUEST_TIMEOUT 30
-#define HTTP_KEEPALIVE_TIMEOUT 60
 
-/* Buffer sizes */
-#define HTTP_REQUEST_BUFFER_SIZE 8192
+/* Buffer sizes.
+ *
+ * The request buffer also holds JSON bodies (bulk ZIP selections carry dozens
+ * of paths), so it is larger than the URI limit below. */
+#define HTTP_REQUEST_BUFFER_SIZE 16384
 #define HTTP_RESPONSE_BUFFER_SIZE 8192
 #define HTTP_URI_MAX_LENGTH 2048
 #define HTTP_HEADER_MAX_COUNT 32
-#define HTTP_HEADER_LINE_MAX 1024
 
-/*
- * File transfer chunk size for sendfile() in /api/download.
- *
- * 2 MB matches FTP_RETR_SENDFILE_CHUNK (ftp_config.h) and halves the
- * sendfile() syscall count vs 1 MB (6 k vs 12 k per 12 GB file).
- *
- * PS5 EAGAIN QUIRK: chunks >= 1 MB can trigger mbuf starvation in
- * PS5's FreeBSD kernel, returning EAGAIN with sbytes=0.  The HTTP
- * sendfile loop in http_server.c now handles this with a 1 ms yield
- * and retry, identical to the ftp_commands.c cmd_RETR strategy.
- *
- * Each EAGAIN costs ~1 ms.  At 2 MB/chunk on PS5: worst case ~6 k
- * EAGAIN events × 1 ms = ~6 s per 12 GB file — negligible vs the
- * total transfer time (12 GB / 1 Gbps ≈ 96 s).  On non-PS5 platforms
- * EAGAIN never triggers, so the 2 MB chunk is pure throughput gain.
- */
+/* Keep HTTP sendfile chunks aligned with the FTP zero-copy path. */
 #define HTTP_SENDFILE_CHUNK_SIZE (2U * 1024U * 1024U)
+#ifndef HTTP_SENDFILE_EAGAIN_RETRIES
+#define HTTP_SENDFILE_EAGAIN_RETRIES 16U
+#endif
+#ifndef HTTP_SENDFILE_EAGAIN_SLEEP_US
+#define HTTP_SENDFILE_EAGAIN_SLEEP_US 1000U
+#endif
 
 /* Thread stack size (bytes) */
 #ifndef HTTP_THREAD_STACK_SIZE
@@ -93,45 +84,12 @@ SOFTWARE.
 /* CSRF token length in hex characters (32 hex = 16 random bytes) */
 #define HTTP_CSRF_TOKEN_LENGTH 32
 
-/*---------------------------------------------------------------------------*
- * Upload / file-operation feature toggle (enabled by default).
- *
- * Gates all web file operations: copy, delete, rename, mkdir, create_file,
- * upload, and CSRF protection.  Set to 0 at compile time to disable.
- *---------------------------------------------------------------------------*/
+/* Gates mutating web filesystem operations and CSRF protection. */
 #ifndef ENABLE_WEB_UPLOAD
 #define ENABLE_WEB_UPLOAD 1
 #endif
 
-/*---------------------------------------------------------------------------*
- * Upload streaming performance tuning
- *
- * HTTP_UPLOAD_CHUNK_SIZE
- *   Heap-allocated read buffer used exclusively while an upload is active.
- *   Each event-loop iteration drains up to this many bytes from the socket.
- *
- *   Rationale:
- *     The connection's header buffer (HTTP_REQUEST_BUFFER_SIZE = 8 KB) is
- *     reused during streaming, capping each read() at 8 KB.  At 113 MB/s
- *     that requires ~13 800 read() + kqueue round-trips per second — well
- *     beyond what a single-threaded event loop can sustain.
- *
- *     256 KB reduces the required syscall rate to ~440/s at 113 MB/s,
- *     comfortably within budget while keeping per-upload heap overhead low.
- *     The buffer is allocated on upload start and freed on completion, so
- *     idle connections pay no memory cost.
- *
- * HTTP_UPLOAD_RCVBUF_SIZE
- *   SO_RCVBUF hint set on each accepted client socket.  A larger kernel
- *   receive buffer absorbs TCP bursts between event-loop wakeups and keeps
- *   the sender's congestion window open.  2 MB is sufficient for RTTs up
- *   to ~140 µs at 113 MB/s (BDP = 113e6 * 140e-6 ≈ 15 KB; 2 MB is 133×
- *   the BDP — intentionally oversized so the kernel never stalls).
- *
- *   IMPORTANT: This is a hint only.  The kernel caps it at
- *   net.core.rmem_max (Linux) or kern.ipc.maxsockbuf (FreeBSD/PS5).
- *   Setting it higher than the system maximum is silently ignored.
- *---------------------------------------------------------------------------*/
+/* Larger upload reads reduce event-loop wakeups; SO_RCVBUF is only a hint. */
 #ifndef HTTP_UPLOAD_CHUNK_SIZE
 #define HTTP_UPLOAD_CHUNK_SIZE    (512U * 1024U)   /* 512 KB per active upload */
 #endif
@@ -140,34 +98,7 @@ SOFTWARE.
 #define HTTP_UPLOAD_RCVBUF_SIZE   (2U * 1024U * 1024U) /* 2 MB SO_RCVBUF hint */
 #endif
 
-/*---------------------------------------------------------------------------*
- * Download pread() chunk size (PATH B — pread + pal_send_all)
- *
- * Used when sendfile() is unsafe (PS5/PS4 PFS/exFAT filesystems).
- * Larger chunks mean fewer pread()+send_all() round-trips per MB.
- * 2 MB halves the syscall count vs the previous 512 KB while staying
- * well within the event-loop thread's heap budget.
- *---------------------------------------------------------------------------*/
-#ifndef HTTP_DOWNLOAD_PREAD_CHUNK
-#define HTTP_DOWNLOAD_PREAD_CHUNK (2U * 1024U * 1024U) /* 2 MB */
-#endif
-
-/*---------------------------------------------------------------------------*
- * HTTP client send buffer (SO_SNDBUF) — download throughput on PS5/PS4
- *
- * OrbisOS (PS5/PS4) clamps TCP send-buffer auto-tuning to a system
- * maximum that is lower than what a GbE LAN download needs.  Without
- * an explicit SO_SNDBUF the accepted socket keeps the kernel default
- * (~256 KB on tested firmwares), forcing pal_send_all() to block as
- * soon as the buffer fills and limiting throughput to ~400 Mbps.
- *
- * Setting 4 MB matches FTP_TCP_DATA_SNDBUF (the same fix applied to
- * FTP data sockets) and allows the TCP pipeline to stay full at
- * 1 Gbps LAN RTTs (0.1–1 ms), recovering the missing 300+ Mbps.
- *
- * On other platforms SO_SNDBUF is left to kernel auto-tuning (set to 0
- * here so the caller can skip the setsockopt() call entirely).
- *---------------------------------------------------------------------------*/
+/* OrbisOS needs an explicit send buffer to keep GbE downloads saturated. */
 #ifndef HTTP_SNDBUF_SIZE
 #if defined(PS5) || defined(PLATFORM_PS5) || defined(PS4) || defined(PLATFORM_PS4)
 #define HTTP_SNDBUF_SIZE (4U * 1024U * 1024U) /* 4 MB — bypass OrbisOS clamp */

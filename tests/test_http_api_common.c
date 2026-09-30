@@ -37,6 +37,9 @@ static int test_query_rejects_invalid_input(void) {
   CHECK(http_api_parse_query_param("?pathname=bad&path=good", "path", out,
                                    sizeof(out)) == 0);
   CHECK(strcmp(out, "good") == 0);
+  CHECK(http_api_query_has_param("?pathname=bad&path=good", "path") == 1);
+  CHECK(http_api_query_has_param("?pathname=bad&path=good", "pathname") == 1);
+  CHECK(http_api_query_has_param("?xid=CUSA12345", "id") == 0);
 #if ENABLE_WEB_UPLOAD
   CHECK(http_api_is_safe_filename("report..txt") == 1);
   CHECK(http_api_is_safe_filename(".") == 0);
@@ -50,7 +53,7 @@ static int test_query_rejects_invalid_input(void) {
 static int test_json_helpers(void) {
   char out[128];
   size_t pos = 0U;
-  CHECK(http_api_json_escape_append(out, sizeof(out), &pos,
+  CHECK(http_json_escape_append(out, sizeof(out), &pos,
                                     "a\"b\n\t") == 0);
   out[pos] = '\0';
   CHECK(strcmp(out, "a\\\"b\\n\\t") == 0);
@@ -75,11 +78,45 @@ static int test_path_confinement(void) {
   CHECK(strncmp(safe, http_api_get_root(), strlen(http_api_get_root())) == 0);
   CHECK(http_api_validate_path(link_path, safe, sizeof(safe)) == 0);
 
+  char escaped_new[512];
+  snprintf(escaped_new, sizeof(escaped_new), "%s/escape/new/file.bin", root);
+  CHECK(http_api_validate_path(escaped_new, safe, sizeof(safe)) == 0);
+
+  char nested_new[512];
+  snprintf(nested_new, sizeof(nested_new), "%s/new/sub/file.bin", root);
+  CHECK(http_api_validate_path(nested_new, safe, sizeof(safe)) == 1);
+  CHECK(strncmp(safe, http_api_get_root(), strlen(http_api_get_root())) == 0);
+
+  char target[512], leaf_link[512], leaf_expected[512];
+  snprintf(target, sizeof(target), "%s/target", root);
+  snprintf(leaf_link, sizeof(leaf_link), "%s/leaf-link", root);
+  CHECK(mkdir(target, 0700) == 0);
+  CHECK(symlink(target, leaf_link) == 0);
+  CHECK(http_api_validate_path(leaf_link, safe, sizeof(safe)) == 1);
+  CHECK(strstr(safe, "/target") != NULL);
+  CHECK(http_api_validate_entry_path(leaf_link, safe, sizeof(safe)) == 1);
+  CHECK(realpath(root, leaf_expected) != NULL);
+  CHECK(strlen(leaf_expected) + sizeof("/leaf-link") < sizeof(leaf_expected));
+  strcat(leaf_expected, "/leaf-link");
+  CHECK(strcmp(safe, leaf_expected) == 0);
+
+  char escaped_entry[512];
+  snprintf(escaped_entry, sizeof(escaped_entry), "%s/escape/new-entry", root);
+  CHECK(http_api_validate_entry_path(escaped_entry, safe, sizeof(safe)) == 0);
+
+  char dot_name[512];
+  snprintf(dot_name, sizeof(dot_name), "%s/..cache", root);
+  CHECK(mkdir(dot_name, 0700) == 0);
+  CHECK(http_api_validate_path(dot_name, safe, sizeof(safe)) == 1);
+
   char traversal[512];
   snprintf(traversal, sizeof(traversal), "%s/../escape", root);
   CHECK(http_api_validate_path(traversal, safe, sizeof(safe)) == 0);
   http_api_set_root("/");
+  unlink(leaf_link);
+  rmdir(target);
   unlink(link_path);
+  rmdir(dot_name);
   rmdir(child);
   rmdir(root);
   rmdir(outside);

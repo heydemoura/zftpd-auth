@@ -6,6 +6,7 @@
 #include "ftp_server.h"
 #include "http_response.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -96,18 +97,13 @@ ftp_server_context_t *http_api_server_ctx(void) { return g_ftp_server_ctx; }
  */
 static int http_validate_and_confine(const char *input, const char *root,
                                      char *out, size_t out_size) {
-  if ((input == NULL) || (root == NULL) || (out == NULL)) {
+  if (input == NULL || root == NULL || out == NULL || out_size == 0U)
     return -1;
-  }
 
-  /* Step 1: normalize (resolve .., ., //) */
   char normalized[FTP_PATH_MAX];
-  if (ftp_path_normalize(input, normalized, sizeof(normalized)) != FTP_OK) {
+  if (ftp_path_normalize(input, normalized, sizeof(normalized)) != FTP_OK)
     return -1;
-  }
 
-  /* Existing paths are checked in canonical form first. This matters on
-   * platforms where an absolute alias such as /tmp resolves elsewhere. */
   char real[FTP_PATH_MAX];
   if (realpath(normalized, real) != NULL) {
     if (ftp_path_is_within_root(real, root) != 1) return -1;
@@ -116,28 +112,46 @@ static int http_validate_and_confine(const char *input, const char *root,
     memcpy(out, real, n + 1U);
     return 0;
   }
+  if (errno != ENOENT && errno != ENOTDIR) return -1;
 
-  /* Non-existing targets cannot be canonicalized yet. Their normalized
-   * path must already be rooted below the canonical server root. */
-  if (ftp_path_is_within_root(normalized, root) != 1) return -1;
-  size_t n = strlen(normalized);
-  if (n + 1U > out_size) return -1;
-  memcpy(out, normalized, n + 1U);
+  char probe[FTP_PATH_MAX];
+  size_t normalized_len = strlen(normalized);
+  if (normalized_len + 1U > sizeof(probe)) return -1;
+  memcpy(probe, normalized, normalized_len + 1U);
+  size_t prefix_len = normalized_len;
 
-  return 0;
+  int ancestor_found = 0;
+  while (prefix_len > 1U) {
+    char *slash = strrchr(probe, '/');
+    if (slash == NULL) return -1;
+    if (slash == probe) {
+      probe[1] = '\0';
+      prefix_len = 1U;
+    } else {
+      *slash = '\0';
+      prefix_len = (size_t)(slash - probe);
+    }
+    if (realpath(probe, real) != NULL) {
+      ancestor_found = 1;
+      break;
+    }
+    if (errno != ENOENT && errno != ENOTDIR) return -1;
+  }
+  if (!ancestor_found) {
+    if (realpath(probe, real) == NULL) return -1;
+  }
+  if (ftp_path_is_within_root(real, root) != 1) return -1;
+
+  const char *suffix = normalized + prefix_len;
+  size_t real_len = strlen(real);
+  size_t suffix_len = strlen(suffix);
+  if (real_len + suffix_len + 1U > out_size) return -1;
+  memcpy(out, real, real_len);
+  memcpy(out + real_len, suffix, suffix_len + 1U);
+  return ftp_path_is_within_root(out, root) == 1 ? 0 : -1;
 }
 
-/*===========================================================================*
- * PATH SECURITY
- *
- *   ┌──────────────────────────────────────────────────┐
- *   │  BLOCKED PATTERNS            REASON              │
- *   │  ../                         traversal           │
- *   │  //                          double-slash trick  │
- *   │  /dev /proc /sys /kern       PS kernel crash     │
- *   │  outside g_http_root         VULN-01/02 fix      │
- *   └──────────────────────────────────────────────────┘
- *===========================================================================*/
+/* HTTP filesystem paths are canonicalized and confined to g_http_root. */
 
 /**
  * @brief Check for directory-traversal attacks
@@ -154,16 +168,11 @@ static int is_safe_path(const char *path) {
     return 0;
   }
 
-  /* Search for ".." components */
-  const char *p = path;
-  while (*p != '\0') {
-    if (p[0] == '.' && p[1] == '.') {
-      /* ".." at start of path, or preceded by '/' */
-      if (p == path || p[-1] == '/') {
-        return 0;
-      }
-    }
-    p++;
+  for (const char *p = path; *p != '\0'; p++) {
+    if (p[0] == '.' && p[1] == '.' &&
+        (p == path || p[-1] == '/') &&
+        (p[2] == '\0' || p[2] == '/'))
+      return 0;
   }
 
   return 1;
@@ -218,128 +227,45 @@ int http_api_validate_path(const char *path, char *safe, size_t safe_size) {
 #endif
 
   /* Root confinement via ftp_path_normalize + ftp_path_is_within_root */
-  if (http_validate_and_confine(path, g_http_root, safe, safe_size) != 0) {
+  if (http_validate_and_confine(path, g_http_root, safe, safe_size) != 0)
     return 0;
-  }
-
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5) || defined(PS4) ||          \
+    defined(PS5)
+  if (!is_ps_safe_path(safe)) return 0;
+#endif
   return 1;
 }
 
-int http_api_buf_append_bytes(char *buf, size_t cap, size_t *pos,
-                            const char *data, size_t len) {
-  if ((buf == NULL) || (pos == NULL) || (data == NULL)) {
-    return -1;
-  }
-  if (*pos > cap) {
-    return -1;
-  }
-  if (len > (cap - *pos)) {
-    return -1;
-  }
-  if (len > 0U) {
-    memcpy(buf + *pos, data, len);
-    *pos += len;
-  }
-  return 0;
+int http_api_validate_entry_path(const char *path, char *safe,
+                                 size_t safe_size) {
+  if (path == NULL || safe == NULL || safe_size == 0U || !is_safe_path(path))
+    return 0;
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5) || defined(PS4) || defined(PS5)
+  if (!is_ps_safe_path(path)) return 0;
+#endif
+
+  char normalized[FTP_PATH_MAX];
+  char parent[FTP_PATH_MAX];
+  char real_parent[FTP_PATH_MAX];
+  if (ftp_path_normalize(path, normalized, sizeof(normalized)) != FTP_OK ||
+      ftp_path_dirname(normalized, parent, sizeof(parent)) != FTP_OK ||
+      realpath(parent, real_parent) == NULL ||
+      ftp_path_is_within_root(real_parent, g_http_root) != 1)
+    return 0;
+
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5) || defined(PS4) || defined(PS5)
+  if (!is_ps_safe_path(real_parent)) return 0;
+#endif
+
+  const char *slash = strrchr(normalized, '/');
+  const char *name = slash != NULL ? slash + 1 : normalized;
+  if (name[0] == '\0' ||
+      ftp_path_join(real_parent, name, safe, safe_size) != FTP_OK ||
+      ftp_path_is_within_root(safe, g_http_root) != 1)
+    return 0;
+  return 1;
 }
 
-int http_api_buf_append_cstr(char *buf, size_t cap, size_t *pos,
-                           const char *str) {
-  if (str == NULL) {
-    return -1;
-  }
-  return http_api_buf_append_bytes(buf, cap, pos, str, strlen(str));
-}
-
-int http_api_buf_append_u64(char *buf, size_t cap, size_t *pos, uint64_t v) {
-  char tmp[32];
-  int n = snprintf(tmp, sizeof(tmp), "%" PRIu64, v);
-  if ((n < 0) || ((size_t)n >= sizeof(tmp))) {
-    return -1;
-  }
-  return http_api_buf_append_bytes(buf, cap, pos, tmp, (size_t)n);
-}
-
-int http_api_buf_append_u32(char *buf, size_t cap, size_t *pos, uint32_t v) {
-  char tmp[16];
-  int n = snprintf(tmp, sizeof(tmp), "%" PRIu32, v);
-  if ((n < 0) || ((size_t)n >= sizeof(tmp))) {
-    return -1;
-  }
-  return http_api_buf_append_bytes(buf, cap, pos, tmp, (size_t)n);
-}
-
-int http_api_buf_append_i32(char *buf, size_t cap, size_t *pos, int32_t v) {
-  char tmp[16];
-  int n = snprintf(tmp, sizeof(tmp), "%" PRId32, v);
-  if ((n < 0) || ((size_t)n >= sizeof(tmp))) {
-    return -1;
-  }
-  return http_api_buf_append_bytes(buf, cap, pos, tmp, (size_t)n);
-}
-
-/*===========================================================================*
- * JSON HELPERS
- *===========================================================================*/
-
-/**
- * @brief Append a JSON-escaped string to buffer
- *
- * Escapes: " \ / \b \f \n \r \t and control chars
- */
-int http_api_json_escape_append(char *buf, size_t cap, size_t *pos,
-                              const char *str) {
-  size_t p = *pos;
-
-  for (const char *s = str; *s != '\0'; s++) {
-    unsigned char c = (unsigned char)*s;
-
-    if (p + 6 >= cap) {
-      return -1; /* would overflow */
-    }
-
-    switch (c) {
-    case '"':
-      buf[p++] = '\\';
-      buf[p++] = '"';
-      break;
-    case '\\':
-      buf[p++] = '\\';
-      buf[p++] = '\\';
-      break;
-    case '\b':
-      buf[p++] = '\\';
-      buf[p++] = 'b';
-      break;
-    case '\f':
-      buf[p++] = '\\';
-      buf[p++] = 'f';
-      break;
-    case '\n':
-      buf[p++] = '\\';
-      buf[p++] = 'n';
-      break;
-    case '\r':
-      buf[p++] = '\\';
-      buf[p++] = 'r';
-      break;
-    case '\t':
-      buf[p++] = '\\';
-      buf[p++] = 't';
-      break;
-    default:
-      if (c < 0x20) {
-        p += (size_t)snprintf(buf + p, cap - p, "\\u%04x", c);
-      } else {
-        buf[p++] = (char)c;
-      }
-      break;
-    }
-  }
-
-  *pos = p;
-  return 0;
-}
 
 /*===========================================================================*
  * QUERY STRING PARSER
@@ -386,6 +312,10 @@ static int decode_query_value(const char *start, char *out, size_t out_size,
   return (allow_empty || wi > 0U) ? 0 : -1;
 }
 
+int http_api_query_has_param(const char *query, const char *key) {
+  return query_value_start(query, key) != NULL;
+}
+
 int http_api_parse_query_param(const char *query, const char *key,
                                char *out, size_t out_size) {
   return decode_query_value(query_value_start(query, key), out, out_size, 0);
@@ -430,9 +360,9 @@ http_response_t *http_api_error_json(http_status_t code, const char *message) {
 
   char body[768];
   size_t pos = 0U;
-  if (http_api_buf_append_cstr(body, sizeof(body), &pos, "{\"error\":\"") != 0 ||
-      http_api_json_escape_append(body, sizeof(body), &pos, message) != 0 ||
-      http_api_buf_append_cstr(body, sizeof(body), &pos, "\"}") != 0) {
+  if (http_buf_append_cstr(body, sizeof(body), &pos, "{\"error\":\"") != 0 ||
+      http_json_escape_append(body, sizeof(body), &pos, message) != 0 ||
+      http_buf_append_cstr(body, sizeof(body), &pos, "\"}") != 0) {
     static const char fallback[] = "{\"error\":\"Response too large\"}";
     http_response_set_body(resp, fallback, sizeof(fallback) - 1U);
     return resp;
@@ -455,8 +385,8 @@ http_response_t *http_api_status_json_200(int ok, const char *message, int code)
                    "{\"ok\":%s,\"status\":\"%s\",\"message\":\"",
                    ok ? "true" : "false", ok ? "ok" : "error");
   if (n < 0 || (size_t)n >= sizeof(prefix) ||
-      http_api_buf_append_bytes(body, sizeof(body), &pos, prefix, (size_t)n) != 0 ||
-      http_api_json_escape_append(body, sizeof(body), &pos, message) != 0) {
+      http_buf_append_bytes(body, sizeof(body), &pos, prefix, (size_t)n) != 0 ||
+      http_json_escape_append(body, sizeof(body), &pos, message) != 0) {
     http_response_destroy(resp);
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Response too large");
   }

@@ -26,9 +26,9 @@ SOFTWARE.
  * @brief HTTP response builder
  *
  * STATUS CODES:
- *   2xx  Success       (200, 201, 204)
+ *   2xx  Success       (200, 201, 204, 206)
  *   3xx  Redirection   (301, 304)
- *   4xx  Client error  (400, 403, 404, 405, 409, 415)
+ *   4xx  Client error  (400, 403, 404, 405, 409, 415, 416)
  *   5xx  Server error  (500)
  */
 
@@ -36,6 +36,7 @@ SOFTWARE.
 #define HTTP_RESPONSE_H
 
 #include "http_config.h"
+#include "pal_limits.h"
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -46,6 +47,7 @@ SOFTWARE.
 typedef enum {
   /*  2xx ── Success  */
   HTTP_STATUS_200_OK = 200,
+  HTTP_STATUS_206_PARTIAL_CONTENT = 206,
   HTTP_STATUS_201_CREATED = 201,
   HTTP_STATUS_204_NO_CONTENT = 204,
 
@@ -60,6 +62,7 @@ typedef enum {
   HTTP_STATUS_405_METHOD_NOT_ALLOWED = 405,
   HTTP_STATUS_409_CONFLICT = 409,
   HTTP_STATUS_415_UNSUPPORTED_MEDIA_TYPE = 415,
+  HTTP_STATUS_416_RANGE_NOT_SATISFIABLE = 416,
 
   /*  5xx ── Server Error  */
   HTTP_STATUS_500_INTERNAL_ERROR = 500,
@@ -91,21 +94,30 @@ typedef struct {
   int sendfile_fd;       /**< File fd (-1 = not used)           */
   off_t sendfile_offset; /**< Current offset in file            */
   size_t sendfile_count; /**< Remaining bytes to send           */
-  int sendfile_safe;     /**< 1 = FS supports sendfile(2) safely;
-                          *   0 = must use pread()+send() fallback.
-                          *
-                          * On PS5/PS4 (FreeBSD), calling sendfile(2) on
-                          * certain filesystem types (exfatfs, msdosfs,
-                          * nullfs, pfsmnt, pfs) dereferences a null
-                          * function pointer inside the kernel vnode pager
-                          * and causes an IMMEDIATE KERNEL PANIC — errno
-                          * is never set, the process never returns.
-                          * The flag is checked in http_server.c BEFORE
-                          * the first call to pal_sendfile(). */
+
 
   /* Chunked directory streaming (for /api/list) */
   void *stream_dir;       /**< DIR* — NULL = not streaming       */
-  char stream_path[1024]; /**< Base path for stat() calls        */
+  char stream_path[PAL_PATH_MAX]; /**< Canonical directory path */
+
+  /*
+   * Producer-driven chunked body, used when the bytes are not simply the file
+   * content (SELF decryption through the VFS).  stream_read returns 0 at EOF,
+   * a negative value on error; stream_close releases the context and is called
+   * by http_response_destroy() even when the transfer was cut short.
+   */
+  void *stream_ctx;
+  ssize_t (*stream_read)(void *ctx, void *buf, size_t len);
+  /* Called once with 0 after the entire body was sent, or -1 if the
+   * connection/producer failed or the response was discarded. */
+  void (*stream_result)(void *ctx, int result);
+  void (*stream_close)(void *ctx);
+  /**
+   * 1 = frame the produced bytes with chunked encoding (no known length),
+   * 0 = send them raw, which requires a Content-Length header.  Console
+   * browsers download reliably only in the second case.
+   */
+  int stream_chunked;
 } http_response_t;
 
 /*===========================================================================*

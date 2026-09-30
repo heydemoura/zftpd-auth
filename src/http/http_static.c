@@ -56,7 +56,7 @@ http_response_t *http_static_serve(const http_request_t *request) {
    *
    *  "css/base.css?v=3"  →  "css/base.css"
    *                 ^── stop here                        */
-  char clean_path[1024];
+  char clean_path[HTTP_URI_MAX_LENGTH];
   {
     const char *qmark = strchr(path, '?');
     size_t plen = qmark ? (size_t)(qmark - path) : strlen(path);
@@ -152,7 +152,6 @@ http_response_t *http_static_serve(const http_request_t *request) {
               return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
             }
             buf = tmp;
-            buf_size = new_size;
             found = buf + prefix_len;
           }
           memmove(found + taglen, found + placelen, suffix_len);

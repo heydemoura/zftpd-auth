@@ -56,7 +56,15 @@ typedef struct {
     size_t body_length;
 } http_request_t;
 
+typedef struct {
+    http_method_t method;
+    char uri[HTTP_URI_MAX_LENGTH];
+    size_t header_length;
+    size_t content_length;
+} http_request_head_t;
+
 int http_parse_request(char *buffer, size_t length, http_request_t *request);
+int http_peek_request_head(const char *buffer, size_t length, http_request_head_t *head);
 const char* http_get_header(const http_request_t *request, const char *name);
 
 #endif /* HTTP_PARSER_H */

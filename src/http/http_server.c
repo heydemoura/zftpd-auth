@@ -21,42 +21,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
-/**
- * @file http_server.c
- * @brief HTTP server — event-loop-driven, non-blocking connections
- *
- * ARCHITECTURE:
- *
- *   ┌────────────────────────────┐
- *   │  kqueue / epoll event loop │
- *   │                            │
- *   │  listen_fd ──► accept()    │
- *   │                  │         │
- *   │      ┌───────────┘         │
- *   │      ▼                     │
- *   │  client_fd  ──► read()     │
- *   │      ▼                     │
- *   │  parse HTTP request        │
- *   │      ▼                     │
- *   │  route to API / static     │
- *   │      ▼                     │
- *   │  send response headers     │
- *   │  send file (if download)   │
- *   │      ▼                     │
- *   │  close or keep-alive       │
- *   └────────────────────────────┘
- */
+/** @file http_server.c @brief HTTP connection lifecycle and request dispatch. */
 
 #include "http_server.h"
+#include "http_server_internal.h"
 #include "ftp_config.h"
 #include "ftp_log.h"
 #include "http_api.h"
+#include "http_api_internal.h"
 #include "http_config.h"
-#if ENABLE_WEB_UPLOAD
-#include "http_csrf.h"
-#endif
 #include "http_parser.h"
 #include "http_response.h"
+#include "http_response_stream.h"
 #include "pal_fileio.h"
 #include "pal_network.h"
 #include "pal_notification.h"
@@ -77,63 +53,57 @@ SOFTWARE.
 #include <unistd.h>
 
 
-/*===========================================================================*
- * INTERNAL TYPES
- *===========================================================================*/
 
-struct http_server {
-  event_loop_t *loop;
-  int listen_fd;
-  uint16_t port;
-  atomic_int connection_count;  /* Phase 4: thread-safe counter */
-  char root_path[FTP_PATH_MAX]; /* filesystem confinement root */
 
-  /* Rest-mode resilience: recreate listen FD after EBADF / stack drop */
-  char bind_addr[128];
-  struct sockaddr_storage listen_addr;
-  socklen_t listen_addr_len;
-  int af;
-  int wake_r; /* event-loop wake pipe (read) */
-  int wake_w; /* event-loop wake pipe (write) */
-  int pending_listen_fd;
-  atomic_int recreating;
-  atomic_int alive; /* 1 while server exists */
-};
-
-typedef struct {
-  http_server_t *server;
-  int fd;
-  char buffer[HTTP_REQUEST_BUFFER_SIZE];
-  size_t buffer_used;
-#if ENABLE_WEB_UPLOAD
-  int upload_active;
-  int upload_fd;
-  size_t upload_remaining;
-  /*
-   * @field upload_chunk_buf
-   * Heap-allocated read buffer for streaming uploads.
-   * NULL when no upload is active.  Allocated to HTTP_UPLOAD_CHUNK_SIZE
-   * at upload start; freed in http_connection_release().
-   *
-   * WHY: the connection's header buffer (conn->buffer) is only
-   * HTTP_REQUEST_BUFFER_SIZE (8 KB).  Reading 8 KB per event-loop
-   * iteration limits upload throughput to a few MB/s.  A dedicated
-   * 256 KB buffer reduces the required syscall rate by 32× at the
-   * same throughput target.
-   *
-   * ISOLATION: this field is only accessed inside ENABLE_WEB_UPLOAD
-   * guards.  FTP paths, download paths, and internal copy are unaffected.
-   *
-   * @note Thread-safety: NOT thread-safe (single event-loop thread)
-   * @note Must be freed (not closed) in http_connection_release()
-   */
-  uint8_t *upload_chunk_buf;
-#endif
-} http_connection_t;
 
 static http_server_t g_http_server;
 static atomic_int g_http_server_in_use = ATOMIC_VAR_INIT(0);
 static http_connection_t g_http_connections[HTTP_MAX_CONNECTIONS];
+
+typedef struct {
+  int fd;
+  http_response_t *response;
+} http_background_response_t;
+
+typedef struct {
+  int fd;
+  http_request_t request;
+  char range_name[6];
+  char range_value[128];
+} http_background_request_t;
+
+/* A game dump can take minutes. Send it outside the event loop so status
+ * requests and other HTTP clients remain responsive during the transfer. */
+static void *http_background_send(void *opaque) {
+  http_background_response_t *task = (http_background_response_t *)opaque;
+  (void)http_response_stream_send(task->fd, task->response, 1);
+  http_response_destroy(task->response);
+  close(task->fd);
+  free(task);
+  return NULL;
+}
+
+/* File reads can block indefinitely on a slow or disconnected USB device.
+ * Resolve and send these GETs off the event loop so status and the rest of
+ * the UI remain usable even while one file operation is stuck. */
+static void *http_background_file_get(void *opaque) {
+  http_background_request_t *task = (http_background_request_t *)opaque;
+  http_response_t *response = http_api_handle(&task->request);
+  if (response == NULL) {
+    response = http_response_create(HTTP_STATUS_500_INTERNAL_ERROR);
+    if (response != NULL) {
+      static const char message[] = "Internal Server Error";
+      (void)http_response_set_body(response, message, sizeof(message) - 1U);
+    }
+  }
+  if (response != NULL) {
+    (void)http_response_stream_send(task->fd, response, 1);
+    http_response_destroy(response);
+  }
+  close(task->fd);
+  free(task);
+  return NULL;
+}
 
 static void http_connections_init(void) {
   for (size_t i = 0; i < (size_t)HTTP_MAX_CONNECTIONS; i++) {
@@ -141,15 +111,12 @@ static void http_connections_init(void) {
     g_http_connections[i].server = NULL;
     g_http_connections[i].buffer_used = 0;
 #if ENABLE_WEB_UPLOAD
-    g_http_connections[i].upload_active = 0;
-    g_http_connections[i].upload_fd = -1;
-    g_http_connections[i].upload_remaining = 0;
-    g_http_connections[i].upload_chunk_buf = NULL;
+    g_http_connections[i].upload.fd = -1;
 #endif
   }
 }
 
-static http_connection_t *http_connection_acquire(http_server_t *server,
+http_connection_t *http_server_connection_acquire(http_server_t *server,
                                                   int client_fd) {
   if ((server == NULL) || (client_fd < 0)) {
     return NULL;
@@ -162,9 +129,7 @@ static http_connection_t *http_connection_acquire(http_server_t *server,
       conn->fd = client_fd;
       conn->buffer_used = 0;
 #if ENABLE_WEB_UPLOAD
-      conn->upload_active = 0;
-      conn->upload_fd = -1;
-      conn->upload_remaining = 0;
+      conn->upload.fd = -1;
 #endif
       return conn;
     }
@@ -172,475 +137,22 @@ static http_connection_t *http_connection_acquire(http_server_t *server,
   return NULL;
 }
 
-static void http_connection_release(http_connection_t *conn) {
+void http_server_connection_release(http_connection_t *conn) {
   if (conn == NULL) {
     return;
   }
 #if ENABLE_WEB_UPLOAD
-  if (conn->upload_fd >= 0) {
-    (void)pal_file_close(conn->upload_fd);
-    conn->upload_fd = -1;
-  }
-  conn->upload_active = 0;
-  conn->upload_remaining = 0;
-  /* Free the upload read buffer if it was allocated */
-  if (conn->upload_chunk_buf != NULL) {
-    free(conn->upload_chunk_buf);
-    conn->upload_chunk_buf = NULL;
-  }
+  http_upload_reset(conn);
 #endif
   conn->fd = -1;
   conn->server = NULL;
   conn->buffer_used = 0;
 }
 
-/*===========================================================================*
- * FORWARD DECLARATIONS
- *===========================================================================*/
-
-static int http_accept_callback(int fd, uint32_t events, void *data);
-static int http_client_callback(int fd, uint32_t events, void *data);
-static int http_wake_callback(int fd, uint32_t events, void *data);
-static int http_handle_request(http_connection_t *conn);
+/* Internal server-core callbacks. */
+static int http_handle_request(http_connection_t *conn, size_t request_length);
 static void http_close_connection(http_connection_t *conn);
-static void http_schedule_listener_recreate(http_server_t *server);
-static int http_open_listen_socket(http_server_t *server, int *out_fd);
 
-/*===========================================================================*
- * SET NON-BLOCKING
- *===========================================================================*/
-
-static int set_nonblocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags < 0) {
-    return -1;
-  }
-  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-static int http_parse_basic_request(const char *buf, char *method,
-                                    size_t method_cap, char *uri,
-                                    size_t uri_cap, size_t *header_len,
-                                    size_t *content_length) {
-  if ((buf == NULL) || (method == NULL) || (uri == NULL) ||
-      (header_len == NULL) || (content_length == NULL)) {
-    return -1;
-  }
-
-  const char *end = strstr(buf, "\r\n\r\n");
-  if (end == NULL) {
-    return -1;
-  }
-  *header_len = (size_t)(end - buf) + 4U;
-
-  const char *line_end = strstr(buf, "\r\n");
-  if (line_end == NULL) {
-    return -1;
-  }
-
-  const char *sp1 = strchr(buf, ' ');
-  if ((sp1 == NULL) || (sp1 >= line_end)) {
-    return -1;
-  }
-  const char *sp2 = strchr(sp1 + 1, ' ');
-  if ((sp2 == NULL) || (sp2 >= line_end)) {
-    return -1;
-  }
-
-  size_t mlen = (size_t)(sp1 - buf);
-  if ((mlen == 0U) || (mlen >= method_cap)) {
-    return -1;
-  }
-  memcpy(method, buf, mlen);
-  method[mlen] = '\0';
-
-  size_t ulen = (size_t)(sp2 - (sp1 + 1));
-  if ((ulen == 0U) || (ulen >= uri_cap)) {
-    return -1;
-  }
-  memcpy(uri, sp1 + 1, ulen);
-  uri[ulen] = '\0';
-
-  *content_length = 0U;
-  const char *p = line_end + 2;
-  while ((p < end) && (p[0] != '\0')) {
-    const char *eol = strstr(p, "\r\n");
-    if ((eol == NULL) || (eol > end)) {
-      break;
-    }
-    if (eol == p) {
-      break;
-    }
-
-    if (strncasecmp(p, "Content-Length:", 15) == 0) {
-      const char *v = p + 15;
-      while ((*v == ' ') || (*v == '\t')) {
-        v++;
-      }
-      unsigned long long cl = strtoull(v, NULL, 10);
-      *content_length = (size_t)cl;
-    }
-
-    p = eol + 2;
-  }
-
-  return 0;
-}
-
-#if ENABLE_WEB_UPLOAD
-
-/**
- * @brief Recursively create directories for a given path.
- *
- * Creates all intermediate directories in the path if they don't exist.
- * Returns 0 on success, -1 on error.
- */
-static int mkdir_recursive(const char *path) {
-  if (path == NULL || path[0] == '\0') {
-    return -1;
-  }
-
-  char buf[1024];
-  size_t len = strlen(path);
-  if (len >= sizeof(buf)) {
-    return -1;
-  }
-  strcpy(buf, path);
-
-  for (size_t i = 1; i < len; i++) {
-    if (buf[i] == '/') {
-      buf[i] = '\0';
-      struct stat st;
-      if (stat(buf, &st) != 0) {
-        if (mkdir(buf, 0777) != 0 && errno != EEXIST) {
-          return -1;
-        }
-      }
-      buf[i] = '/';
-    }
-  }
-
-  struct stat st;
-  if (stat(buf, &st) != 0) {
-    if (mkdir(buf, 0777) != 0 && errno != EEXIST) {
-      return -1;
-    }
-  }
-
-  return 0;
-}
-
-static int url_decode_component(const char *in, char *out, size_t out_cap) {
-  if ((in == NULL) || (out == NULL) || (out_cap < 2U)) {
-    return -1;
-  }
-
-  size_t in_pos = 0U;
-  size_t out_pos = 0U;
-
-  while ((in[in_pos] != '\0') && (in[in_pos] != '&') &&
-         (out_pos < (out_cap - 1U))) {
-    unsigned char ch = (unsigned char)in[in_pos];
-    if ((ch == '%') && (in[in_pos + 1] != '\0') && (in[in_pos + 2] != '\0')) {
-      unsigned char hi = (unsigned char)in[in_pos + 1];
-      unsigned char lo = (unsigned char)in[in_pos + 2];
-      unsigned int v_hi;
-      unsigned int v_lo;
-
-      if ((hi >= '0') && (hi <= '9')) {
-        v_hi = (unsigned int)(hi - '0');
-      } else if ((hi >= 'A') && (hi <= 'F')) {
-        v_hi = 10U + (unsigned int)(hi - 'A');
-      } else if ((hi >= 'a') && (hi <= 'f')) {
-        v_hi = 10U + (unsigned int)(hi - 'a');
-      } else {
-        v_hi = 0xFFFFFFFFU;
-      }
-
-      if ((lo >= '0') && (lo <= '9')) {
-        v_lo = (unsigned int)(lo - '0');
-      } else if ((lo >= 'A') && (lo <= 'F')) {
-        v_lo = 10U + (unsigned int)(lo - 'A');
-      } else if ((lo >= 'a') && (lo <= 'f')) {
-        v_lo = 10U + (unsigned int)(lo - 'a');
-      } else {
-        v_lo = 0xFFFFFFFFU;
-      }
-
-      if ((v_hi != 0xFFFFFFFFU) && (v_lo != 0xFFFFFFFFU)) {
-        unsigned char decoded = (unsigned char)((v_hi << 4U) | v_lo);
-        if (decoded == '\0') {
-          return -1;
-        }
-        out[out_pos++] = (char)decoded;
-        in_pos += 3U;
-        continue;
-      }
-    }
-
-    if (ch == '+') {
-      out[out_pos++] = ' ';
-    } else {
-      out[out_pos++] = (char)ch;
-    }
-    in_pos++;
-  }
-
-  out[out_pos] = '\0';
-  return 0;
-}
-
-static int get_query_param(const char *uri, const char *key, char *out,
-                           size_t out_cap) {
-  if ((uri == NULL) || (key == NULL) || (out == NULL) || (out_cap < 2U)) {
-    return -1;
-  }
-
-  const char *q = strchr(uri, '?');
-  if (q == NULL) {
-    return -1;
-  }
-  q++;
-
-  char pattern[64];
-  (void)snprintf(pattern, sizeof(pattern), "%s=", key);
-  const char *p = strstr(q, pattern);
-  if (p == NULL) {
-    return -1;
-  }
-  p += strlen(pattern);
-
-  if (url_decode_component(p, out, out_cap) != 0) {
-    return -1;
-  }
-  if (out[0] == '\0') {
-    return -1;
-  }
-  return 0;
-}
-
-static int is_safe_path_local(const char *path) {
-  if (path == NULL || path[0] != '/') {
-    return 0;
-  }
-  if (strstr(path, "//") != NULL) {
-    return 0;
-  }
-  const char *p = path;
-  while (*p != '\0') {
-    if ((p[0] == '.') && (p[1] == '.')) {
-      if ((p == path) || (p[-1] == '/')) {
-        return 0;
-      }
-    }
-    p++;
-  }
-  return 1;
-}
-
-static int is_safe_filename_local(const char *name) {
-  if ((name == NULL) || (name[0] == '\0')) {
-    return 0;
-  }
-  if (strstr(name, "..") != NULL) {
-    return 0;
-  }
-  for (const char *p = name; *p != '\0'; p++) {
-    if ((*p == '/') || (*p == '\\')) {
-      return 0;
-    }
-  }
-  return 1;
-}
-#endif
-
-/*===========================================================================*
- * REST-MODE LISTENER RESILIENCE
- *===========================================================================*/
-
-static int http_open_listen_socket(http_server_t *server, int *out_fd) {
-  int fd;
-  int reuse = 1;
-
-  if ((server == NULL) || (out_fd == NULL)) {
-    return -1;
-  }
-
-  fd = socket(server->af, SOCK_STREAM, 0);
-  if (fd < 0) {
-    return -1;
-  }
-
-  (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-  if (server->af == AF_INET6) {
-    int v6only = 0;
-    (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
-  }
-
-  if (bind(fd, (struct sockaddr *)&server->listen_addr,
-           server->listen_addr_len) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  if (listen(fd, 128) < 0) {
-    close(fd);
-    return -1;
-  }
-
-  if (set_nonblocking(fd) != 0) {
-    close(fd);
-    return -1;
-  }
-
-  *out_fd = fd;
-  return 0;
-}
-
-static void http_wake_event_loop(http_server_t *server) {
-  char byte = 1;
-  ssize_t n;
-  if ((server == NULL) || (server->wake_w < 0)) {
-    return;
-  }
-  n = write(server->wake_w, &byte, 1);
-  if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-    /* Best-effort wake; recreate thread will retry on next attempt. */
-  }
-}
-
-static int http_wake_callback(int fd, uint32_t events, void *data) {
-  http_server_t *server = (http_server_t *)data;
-  char buf[32];
-  (void)events;
-
-  if ((server == NULL) || (atomic_load(&server->alive) == 0)) {
-    return -1;
-  }
-
-  /* Drain wake pipe */
-  for (;;) {
-    ssize_t n = read(fd, buf, sizeof(buf));
-    if (n <= 0) {
-      break;
-    }
-  }
-
-  if (server->pending_listen_fd >= 0) {
-    int new_fd = server->pending_listen_fd;
-    server->pending_listen_fd = -1;
-
-    if (server->listen_fd >= 0 && server->listen_fd != new_fd) {
-      (void)event_loop_remove(server->loop, server->listen_fd);
-      close(server->listen_fd);
-    }
-
-    if (event_loop_add(server->loop, new_fd, EVENT_READ, http_accept_callback,
-                       server) != 0) {
-      ftp_log_line(FTP_LOG_ERROR,
-                   "[restmode-http] Failed to register recreated listen FD");
-      close(new_fd);
-      atomic_store(&server->recreating, 0);
-      http_schedule_listener_recreate(server);
-      return 0;
-    }
-
-    server->listen_fd = new_fd;
-    atomic_store(&server->recreating, 0);
-    ftp_log_line(FTP_LOG_INFO,
-                 "[restmode-http] Listen socket recreated successfully");
-    {
-      char msg[96];
-      (void)snprintf(msg, sizeof(msg), "zftpd: HTTP resumed on port %u",
-                     (unsigned)server->port);
-      pal_notification_send(msg);
-    }
-  }
-
-  return 0;
-}
-
-static void *http_recreate_thread(void *arg) {
-  http_server_t *server = (http_server_t *)arg;
-  unsigned attempt = 0U;
-
-  if (server == NULL) {
-    return NULL;
-  }
-
-  while (atomic_load(&server->alive) != 0) {
-    int new_fd = -1;
-
-    if ((attempt % 3U) == 0U && attempt > 0U) {
-      (void)pal_network_reinit();
-    }
-
-    if (http_open_listen_socket(server, &new_fd) == 0) {
-      server->pending_listen_fd = new_fd;
-      http_wake_event_loop(server);
-      return NULL;
-    }
-
-    {
-      unsigned delay = pal_restmode_backoff_ms(attempt);
-      char log_msg[128];
-      (void)snprintf(log_msg, sizeof(log_msg),
-                     "[restmode-http] recreate failed — retry in %u ms", delay);
-      ftp_log_line(FTP_LOG_WARN, log_msg);
-      if (pal_restmode_sleep_ms(delay, &server->alive) != 0) {
-        break;
-      }
-    }
-    attempt++;
-  }
-
-  atomic_store(&server->recreating, 0);
-  return NULL;
-}
-
-static void http_schedule_listener_recreate(http_server_t *server) {
-  pthread_t tid;
-  pthread_attr_t attr;
-  int expected = 0;
-
-  if ((server == NULL) || (atomic_load(&server->alive) == 0)) {
-    return;
-  }
-
-  if (!atomic_compare_exchange_strong(&server->recreating, &expected, 1)) {
-    return; /* already recreating */
-  }
-
-  ftp_log_line(FTP_LOG_WARN,
-               "[restmode-http] Listener lost — scheduling recreate");
-
-  if (server->listen_fd >= 0) {
-    (void)event_loop_remove(server->loop, server->listen_fd);
-    close(server->listen_fd);
-    server->listen_fd = -1;
-  }
-
-  if (pthread_attr_init(&attr) == 0) {
-    (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&tid, &attr, http_recreate_thread, server) != 0) {
-      atomic_store(&server->recreating, 0);
-      ftp_log_line(FTP_LOG_ERROR,
-                   "[restmode-http] Failed to start recreate thread");
-    }
-    (void)pthread_attr_destroy(&attr);
-  } else if (pthread_create(&tid, NULL, http_recreate_thread, server) != 0) {
-    atomic_store(&server->recreating, 0);
-    ftp_log_line(FTP_LOG_ERROR,
-                 "[restmode-http] Failed to start recreate thread");
-  } else {
-    (void)pthread_detach(tid);
-  }
-}
-
-/*===========================================================================*
- * CREATE / DESTROY
- *===========================================================================*/
 
 http_server_t *http_server_create(event_loop_t *loop, const char *bind_addr,
                                   const char *root_path) {
@@ -656,91 +168,16 @@ http_server_t *http_server_create(event_loop_t *loop, const char *bind_addr,
   g_http_server.listen_fd = -1;
   g_http_server.wake_r = -1;
   g_http_server.wake_w = -1;
-  g_http_server.pending_listen_fd = -1;
+  atomic_store(&g_http_server.pending_listen_fd, -1);
   g_http_server.loop = loop;
   atomic_store(&g_http_server.connection_count, 0);
   atomic_store(&g_http_server.recreating, 0);
   atomic_store(&g_http_server.alive, 1);
 
-  /* Store root path for filesystem confinement */
-  size_t rlen = strlen(root_path);
-  if (rlen >= sizeof(g_http_server.root_path)) {
-    return NULL;
-  }
-  memcpy(g_http_server.root_path, root_path, rlen + 1U);
-
-  size_t blen = strlen(bind_addr);
-  if (blen >= sizeof(g_http_server.bind_addr)) {
-    return NULL;
-  }
-  memcpy(g_http_server.bind_addr, bind_addr, blen + 1U);
-
-  /* Propagate root to API layer */
   http_api_set_root(root_path);
-
   http_connections_init();
-
-  /* Parse bind address (supports "[::1]:8888" and "0.0.0.0:8888") */
-  if (pal_make_sockaddr_ex(bind_addr, &g_http_server.listen_addr,
-                           &g_http_server.listen_addr_len) != FTP_OK) {
-    return NULL;
-  }
-
-  /* Determine address family and extract port */
-  g_http_server.af = g_http_server.listen_addr.ss_family;
-  uint16_t port = 0;
-  if (g_http_server.af == AF_INET6) {
-    struct sockaddr_in6 *addr6 =
-        (struct sockaddr_in6 *)&g_http_server.listen_addr;
-    port = ntohs(addr6->sin6_port);
-  } else if (g_http_server.af == AF_INET) {
-    struct sockaddr_in *addr4 =
-        (struct sockaddr_in *)&g_http_server.listen_addr;
-    port = ntohs(addr4->sin_port);
-  } else {
-    return NULL;
-  }
-  g_http_server.port = port;
-
-  if (http_open_listen_socket(&g_http_server, &g_http_server.listen_fd) != 0) {
-    return NULL;
-  }
-
-  /* Wake pipe: recreate thread → event-loop thread (safe event_loop_add). */
-  {
-    int fds[2];
-    if (pipe(fds) == 0) {
-      g_http_server.wake_r = fds[0];
-      g_http_server.wake_w = fds[1];
-      (void)set_nonblocking(g_http_server.wake_r);
-      if (event_loop_add(loop, g_http_server.wake_r, EVENT_READ,
-                         http_wake_callback, &g_http_server) != 0) {
-        close(g_http_server.wake_r);
-        close(g_http_server.wake_w);
-        g_http_server.wake_r = -1;
-        g_http_server.wake_w = -1;
-        ftp_log_line(FTP_LOG_WARN,
-                     "[restmode-http] Wake pipe registration failed — "
-                     "HTTP recreate disabled");
-      }
-    } else {
-      ftp_log_line(FTP_LOG_WARN,
-                   "[restmode-http] pipe() failed — HTTP recreate disabled");
-    }
-  }
-
-  /* Register with event loop */
-  if (event_loop_add(loop, g_http_server.listen_fd, EVENT_READ,
-                     http_accept_callback, &g_http_server) != 0) {
-    if (g_http_server.wake_r >= 0) {
-      event_loop_remove(loop, g_http_server.wake_r);
-      close(g_http_server.wake_r);
-      close(g_http_server.wake_w);
-      g_http_server.wake_r = -1;
-      g_http_server.wake_w = -1;
-    }
-    close(g_http_server.listen_fd);
-    g_http_server.listen_fd = -1;
+  if (http_listener_start(&g_http_server, bind_addr) != 0) {
+    atomic_store(&g_http_server.alive, 0);
     return NULL;
   }
 
@@ -752,174 +189,21 @@ void http_server_destroy(http_server_t *server) {
   if (server != NULL) {
     if (server == &g_http_server) {
       atomic_store(&server->alive, 0);
-      http_wake_event_loop(server);
-
       for (size_t i = 0; i < (size_t)HTTP_MAX_CONNECTIONS; i++) {
-        if (g_http_connections[i].fd >= 0) {
+        if (g_http_connections[i].fd >= 0)
           http_close_connection(&g_http_connections[i]);
-        }
       }
-      if (server->listen_fd >= 0) {
-        event_loop_remove(server->loop, server->listen_fd);
-        close(server->listen_fd);
-        server->listen_fd = -1;
-      }
-      if (server->pending_listen_fd >= 0) {
-        close(server->pending_listen_fd);
-        server->pending_listen_fd = -1;
-      }
-      if (server->wake_r >= 0) {
-        event_loop_remove(server->loop, server->wake_r);
-        close(server->wake_r);
-        server->wake_r = -1;
-      }
-      if (server->wake_w >= 0) {
-        close(server->wake_w);
-        server->wake_w = -1;
-      }
-      /* Wait briefly for recreate thread to observe alive==0 */
-      {
-        unsigned waited = 0U;
-        while ((atomic_load(&server->recreating) != 0) && (waited < 2000U)) {
-          usleep(50U * 1000U);
-          waited += 50U;
-        }
-      }
+      http_listener_stop(server);
       atomic_store(&g_http_server_in_use, 0);
     }
   }
 }
 
-/*===========================================================================*
- * ACCEPT CALLBACK — new client connecting
- *===========================================================================*/
 
-static int http_accept_callback(int fd, uint32_t events, void *data) {
-  http_server_t *server = (http_server_t *)data;
-
-  if (server == NULL) {
-    return -1;
-  }
-
-  /* Rest Mode / kernel reclaim: listen FD errored or closed. */
-  if (events & (EVENT_ERROR | EVENT_CLOSE)) {
-    http_schedule_listener_recreate(server);
-    return -1; /* remove this (dead) FD from the event loop */
-  }
-
-  struct sockaddr_storage client_addr;
-  socklen_t addr_len = sizeof(client_addr);
-
-  int client_fd = accept(fd, (struct sockaddr *)&client_addr, &addr_len);
-  if (client_fd < 0) {
-    int err = errno;
-    if ((err == EAGAIN) || (err == EWOULDBLOCK) || (err == EINTR)) {
-      /* Opportunistic stale-FD probe when the listen socket woke with no
-       * client — catches the "FD survives but stack is dead" Rest Mode case. */
-      if (!pal_listen_fd_alive(fd)) {
-        http_schedule_listener_recreate(server);
-        return -1;
-      }
-      return 0;
-    }
-    if (pal_errno_is_listener_lost(err)) {
-      http_schedule_listener_recreate(server);
-      return -1;
-    }
-    return 0; /* transient error, keep listening */
-  }
-
-  /*
-   * SOCKET TUNING FOR UPLOAD THROUGHPUT
-   *
-   * TCP_NODELAY
-   *   Disable Nagle's algorithm on the server's outgoing path.
-   *   Nagle batches small writes, adding up to 200 ms of latency for
-   *   ACKs and HTTP response headers.  Disabling it ensures the 200-byte
-   *   "HTTP/1.1 200 OK" response after upload completes is sent immediately
-   *   rather than waiting for the kernel to accumulate more data.
-   *   Has no effect on incoming data (upload body direction).
-   *
-   * SO_RCVBUF
-   *   Hint the kernel to allocate a 2 MB receive buffer for this socket.
-   *   A larger receive buffer allows the kernel to acknowledge incoming
-   *   data in larger batches, keeping the sender's congestion window open
-   *   between event-loop wakeups.  Without this, the default receive buffer
-   *   (~87 KB on Linux, ~256 KB on FreeBSD) can be drained faster than the
-   *   event loop wakes up, forcing the remote sender to pause.
-   *
-   *   IMPORTANT: setsockopt(SO_RCVBUF) is a hint.  The kernel caps it at
-   *   net.core.rmem_max (Linux) or kern.ipc.maxsockbuf (FreeBSD/PS5) and
-   *   silently ignores requests above the system maximum.  Setting it here
-   *   is therefore always safe — worst case it has no effect.
-   *
-   * @note These options apply to ALL HTTP client connections, not just
-   *       uploads.  TCP_NODELAY is universally beneficial for request/
-   *       response HTTP.  The SO_RCVBUF hint is harmless for short API
-   *       requests (the kernel won't actually allocate the full buffer
-   *       until data arrives).
-   *
-   * @note Thread-safety: called only in the accept callback (single
-   *       event-loop thread).
-   */
-  {
-    int nodelay = 1;
-    (void)setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
-                     &nodelay, sizeof(nodelay));
-
-    int rcvbuf = (int)HTTP_UPLOAD_RCVBUF_SIZE;
-    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF,
-                     &rcvbuf, sizeof(rcvbuf));
-
-#if (HTTP_SNDBUF_SIZE) > 0U
-    /*
-     * SO_SNDBUF — bypass OrbisOS TCP send-buffer clamping.
-     *
-     * Without this, PS5/PS4 accepted sockets keep the kernel default
-     * (~256 KB), causing pal_send_all() to block as soon as the buffer
-     * fills and capping HTTP downloads to ~400 Mbps.  4 MB matches
-     * FTP_TCP_DATA_SNDBUF and keeps the TCP pipeline saturated at
-     * 1 Gbps LAN RTTs.  On non-PS platforms HTTP_SNDBUF_SIZE == 0 so
-     * this block is compiled out and auto-tuning remains active.
-     */
-    {
-      int sndbuf = (int)HTTP_SNDBUF_SIZE;
-      (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
-                       &sndbuf, sizeof(sndbuf));
-    }
-#endif
-  }
-
-  /* Connection limit */
-  if (atomic_load(&server->connection_count) >= HTTP_MAX_CONNECTIONS) {
-    close(client_fd);
-    return 0;
-  }
-
-  http_connection_t *conn = http_connection_acquire(server, client_fd);
-  if (conn == NULL) {
-    close(client_fd);
-    return 0;
-  }
-
-  (void)atomic_fetch_add(&server->connection_count, 1);
-
-  /* Register for read events */
-  event_loop_add(server->loop, client_fd, EVENT_READ, http_client_callback,
-                 conn);
-
-  return 0;
-}
-
-/*===========================================================================*
- * CLIENT CALLBACK — data available on client socket
- *===========================================================================*/
-
-static int http_client_callback(int fd, uint32_t events, void *data) {
+int http_server_client_callback(int fd, uint32_t events, void *data) {
   http_connection_t *conn = (http_connection_t *)data;
   (void)fd;
 
-  /* Connection closed or error */
   if (events & (EVENT_CLOSE | EVENT_ERROR)) {
     http_close_connection(conn);
     return -1;
@@ -927,138 +211,11 @@ static int http_client_callback(int fd, uint32_t events, void *data) {
 
   if (events & EVENT_READ) {
 #if ENABLE_WEB_UPLOAD
-    if (conn->upload_active != 0) {
-      /*
-       * UPLOAD STREAMING READ
-       *
-       * Use the pre-allocated upload_chunk_buf (HTTP_UPLOAD_CHUNK_SIZE =
-       * 256 KB) instead of conn->buffer (HTTP_REQUEST_BUFFER_SIZE = 8 KB).
-       *
-       * WHY: reading 8 KB per event-loop iteration caps throughput because
-       * each iteration requires a kqueue/epoll round-trip (typically
-       * 5-20 µs).  At 8 KB × 50 000 wakeups/s the ceiling is ~400 MB/s in
-       * theory, but in practice kernel scheduling overhead and interrupt
-       * coalescing bring the real ceiling much lower (measured ~5 MB/s).
-       *
-       * At 256 KB the required syscall rate for 113 MB/s drops to ~440/s,
-       * well within the event-loop budget.  Each read() drains a much
-       * larger window of TCP receive-buffer data in one call, so the kernel
-       * spends far more time in DMA and far less in context switches.
-       *
-       * FALLBACK: if malloc failed during upload initialisation,
-       * upload_chunk_buf is NULL and we fall back to conn->buffer (8 KB).
-       * This preserves correctness at the cost of performance.
-       *
-       * ISOLATION: only active when upload_active != 0.  All other HTTP
-       * paths (headers, download, API) continue to use conn->buffer.
-       * FTP and internal copy are completely unaffected.
-       *
-       * @pre  conn->upload_chunk_buf allocated at upload start (or NULL)
-       * @pre  conn->upload_remaining > 0
-       * @post conn->upload_remaining decremented by bytes written to file
-       */
-      uint8_t *rd_buf  = (conn->upload_chunk_buf != NULL)
-                             ? conn->upload_chunk_buf
-                             : (uint8_t *)conn->buffer;
-      size_t   rd_cap  = (conn->upload_chunk_buf != NULL)
-                             ? (size_t)HTTP_UPLOAD_CHUNK_SIZE
-                             : sizeof(conn->buffer);
-
-      ssize_t n = read(conn->fd, rd_buf, rd_cap);
-      if (n <= 0) {
+    if (http_upload_is_active(conn)) {
+      if (http_upload_continue(conn) < 0) {
         http_close_connection(conn);
         return -1;
       }
-
-      size_t got = (size_t)n;
-      if (got > conn->upload_remaining) {
-        got = conn->upload_remaining;
-      }
-
-      if ((got > 0U) && (conn->upload_fd >= 0)) {
-        /*
-         * DIRECT WRITE — bypass pal_file_write_all()
-         *
-         * pal_file_write_all() subdivides writes into PAL_FILE_WRITE_CHUNK_MAX
-         * (128 KB on PS5, 64 KB on PS4).  That limit exists for FTP STOR to
-         * prevent TCP recv-buffer stalls while the kernel is busy with a long
-         * write: the FTP STOR loop reads from the socket and writes to disk
-         * serially, so a slow 4 MB write would stall socket reads long enough
-         * to fill the TCP window and trigger a client inactivity timeout.
-         *
-         * HTTP upload is different:
-         *   - We already have the full chunk (up to 256 KB) in rd_buf.
-         *   - The socket read and the disk write are NOT interleaved inside a
-         *     single loop iteration, so TCP flow control is not a concern.
-         *   - Writing 256 KB in a single write() call instead of two 128 KB
-         *     calls halves the number of PFS AES-XTS context setups per MB.
-         *     This is the primary reason /data uploads were capped at ~25 MB/s
-         *     while USB (no encryption) reached 80 MB/s.
-         *
-         * We reproduce the same direct-write loop used by pal_file_copy_atomic
-         * (which bypasses pal_file_write_all for identical reasons) and handle
-         * the PS4/PS5 PFS silent-ENOSPC (write() == 0) quirk.
-         *
-         * @pre  rd_buf[0..got-1] contains valid data to write
-         * @pre  conn->upload_fd is a valid open writable file descriptor
-         */
-        const uint8_t *wr_p   = rd_buf;
-        size_t         wr_rem = got;
-        int            wr_ok  = 1;
-
-        while (wr_rem > 0U) {
-          ssize_t w = write(conn->upload_fd, wr_p, wr_rem);
-          if (w > 0) {
-            wr_p   += (size_t)w;
-            wr_rem -= (size_t)w;
-            continue;
-          }
-          if ((w < 0) && (errno == EINTR)) {
-            continue;
-          }
-          /* w == 0: PS4/PS5 PFS silent ENOSPC */
-          wr_ok = 0;
-          break;
-        }
-
-        if (wr_ok == 0) {
-          http_close_connection(conn);
-          return -1;
-        }
-      }
-
-      conn->upload_remaining -= got;
-      if (conn->upload_remaining == 0U) {
-        if (conn->upload_fd >= 0) {
-          (void)pal_file_close(conn->upload_fd);
-          conn->upload_fd = -1;
-        }
-
-        http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
-        if (resp != NULL) {
-          http_response_add_header(resp, "Content-Type", "application/json");
-          http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
-          const char *body = "{\"ok\":true}";
-          http_response_set_body(resp, body, strlen(body));
-          if (resp->used > 0) {
-            size_t total = 0;
-            size_t remain = resp->used;
-            while (remain > 0) {
-              ssize_t sent = write(conn->fd, resp->data + total, remain);
-              if (sent <= 0) {
-                break;
-              }
-              total += (size_t)sent;
-              remain -= (size_t)sent;
-            }
-          }
-          http_response_destroy(resp);
-        }
-
-        http_close_connection(conn);
-        return -1;
-      }
-
       return 0;
     }
 #endif
@@ -1070,8 +227,11 @@ static int http_client_callback(int fd, uint32_t events, void *data) {
       return -1;
     }
 
-    ssize_t n = read(conn->fd, conn->buffer + conn->buffer_used, remaining);
-
+    ssize_t n;
+    do {
+      n = read(conn->fd, conn->buffer + conn->buffer_used, remaining);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
     if (n <= 0) {
       http_close_connection(conn);
       return -1;
@@ -1080,513 +240,133 @@ static int http_client_callback(int fd, uint32_t events, void *data) {
     conn->buffer_used += (size_t)n;
     conn->buffer[conn->buffer_used] = '\0';
 
-    /* Check for complete HTTP request (headers end with \r\n\r\n) */
-    const char *end = strstr(conn->buffer, "\r\n\r\n");
-    if (end != NULL) {
-      char method[8];
-      char uri[HTTP_URI_MAX_LENGTH];
-      size_t header_len = 0U;
-      size_t content_length = 0U;
-
-      if (http_parse_basic_request(conn->buffer, method, sizeof(method), uri,
-                                   sizeof(uri), &header_len,
-                                   &content_length) != 0) {
-        http_close_connection(conn);
-        return -1;
-      }
-
-#if ENABLE_WEB_UPLOAD
-      if ((strcmp(method, "POST") == 0) &&
-          (strncmp(uri, "/api/upload", 11) == 0)) {
-        http_request_t up_req;
-        if ((http_parse_request(conn->buffer, conn->buffer_used, &up_req) <
-             0) ||
-            (http_csrf_validate(&up_req) != 0)) {
-          http_response_t *resp =
-              http_response_create(HTTP_STATUS_403_FORBIDDEN);
-          if (resp != NULL) {
-            http_response_add_header(resp, "Content-Type", "application/json");
-            http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
-            const char *body = "{\"error\":\"Invalid or missing CSRF token\"}";
-            http_response_set_body(resp, body, strlen(body));
-            if (resp->used > 0) {
-              ssize_t wr = write(conn->fd, resp->data, resp->used);
-              (void)wr;
-            }
-            http_response_destroy(resp);
-          }
-          http_close_connection(conn);
-          return -1;
-        }
-
-        if (content_length == 0U) {
-          http_response_t *resp =
-              http_response_create(HTTP_STATUS_400_BAD_REQUEST);
-          if (resp != NULL) {
-            const char *msg = "Missing Content-Length";
-            http_response_set_body(resp, msg, strlen(msg));
-            if (resp->used > 0) {
-              ssize_t wr = write(conn->fd, resp->data, resp->used);
-              (void)wr;
-            }
-            http_response_destroy(resp);
-          }
-          http_close_connection(conn);
-          return -1;
-        }
-
-        char dir_path[1024];
-        char file_name[256];
-        if ((get_query_param(uri, "path", dir_path, sizeof(dir_path)) != 0) ||
-            (get_query_param(uri, "name", file_name, sizeof(file_name)) != 0)) {
-          http_close_connection(conn);
-          return -1;
-        }
-        if (!is_safe_path_local(dir_path) ||
-            !is_safe_filename_local(file_name)) {
-          http_close_connection(conn);
-          return -1;
-        }
-
-        char full[1024];
-        if (strcmp(dir_path, "/") == 0) {
-          int room = (int)(sizeof(full) - 3 - strlen(file_name));
-          if (room < 0) room = 0;
-          (void)snprintf(full, sizeof(full), "/%s", file_name);
-        } else {
-          int room = (int)(sizeof(full) - 2 - strlen(file_name));
-          if (room < 1) room = 1;
-          (void)snprintf(full, sizeof(full), "%.*s/%s", room, dir_path, file_name);
-        }
-        if (!is_safe_path_local(full)) {
-          http_close_connection(conn);
-          return -1;
-        }
-
-        /*
-         * VULN-02 fix: confine upload path to the HTTP root
-         *
-         *   is_safe_path_local()  blocks ".." and "//"
-         *   http_api_get_root()   confines to server root directory
-         */
-        {
-          const char *http_root = http_api_get_root();
-          if (http_root[0] != '\0') {
-            size_t rlen = strlen(http_root);
-            /* root "/" allows everything */
-            if (!(rlen == 1U && http_root[0] == '/')) {
-              if (strncmp(full, http_root, rlen) != 0 ||
-                  (full[rlen] != '/' && full[rlen] != '\0')) {
-                http_close_connection(conn);
-                return -1;
-              }
-            }
-          }
-        }
-
-        /* Create intermediate directories if needed (for folder uploads) */
-        char dir_buf[1024];
-        const char *last_slash = strrchr(full, '/');
-        if (last_slash != NULL && last_slash != full) {
-          size_t dir_len = (size_t)(last_slash - full);
-          if (dir_len < sizeof(dir_buf)) {
-            strncpy(dir_buf, full, dir_len);
-            dir_buf[dir_len] = '\0';
-            if (mkdir_recursive(dir_buf) != 0) {
-              /* Directory creation failed — send HTTP 500 error */
-              http_response_t *resp = http_response_create(HTTP_STATUS_500_INTERNAL_ERROR);
-              if (resp != NULL) {
-                http_response_add_header(resp, "Content-Type", "application/json");
-                http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
-                const char *body = "{\"error\":\"Failed to create directory\"}";
-                http_response_set_body(resp, body, strlen(body));
-                if (resp->used > 0) {
-                  ssize_t wr = write(conn->fd, resp->data, resp->used);
-                  (void)wr;
-                }
-                http_response_destroy(resp);
-              }
-              http_close_connection(conn);
-              return -1;
-            }
-          }
-        }
-
-        int out_fd = pal_file_open(full, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (out_fd < 0) {
-          http_response_t *resp = http_response_create(HTTP_STATUS_500_INTERNAL_ERROR);
-          if (resp != NULL) {
-            http_response_add_header(resp, "Content-Type", "application/json");
-            http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
-            const char *body = "{\"error\":\"Failed to open file for writing\"}";
-            http_response_set_body(resp, body, strlen(body));
-            if (resp->used > 0) {
-              ssize_t wr = write(conn->fd, resp->data, resp->used);
-              (void)wr;
-            }
-            http_response_destroy(resp);
-          }
-          http_close_connection(conn);
-          return -1;
-        }
-        conn->upload_fd = out_fd;
-        conn->upload_active = 1;
-
-        /*
-         * Allocate the large upload read buffer (HTTP_UPLOAD_CHUNK_SIZE =
-         * 256 KB).  If malloc fails we fall back to conn->buffer (8 KB) —
-         * correctness is preserved, only throughput is affected.
-         *
-         * The buffer is freed in http_connection_release() regardless of
-         * how the connection terminates (success, error, or timeout).
-         */
-        if (conn->upload_chunk_buf == NULL) {
-          conn->upload_chunk_buf = (uint8_t *)malloc(HTTP_UPLOAD_CHUNK_SIZE);
-          /* malloc failure is non-fatal: fallback path uses conn->buffer */
-        }
-
-        size_t in_buf = 0U;
-        if (conn->buffer_used > header_len) {
-          in_buf = conn->buffer_used - header_len;
-          if (in_buf > content_length) {
-            in_buf = content_length;
-          }
-        }
-
-        if (in_buf > 0U) {
-          if (pal_file_write_all(out_fd, conn->buffer + header_len, in_buf) <
-              0) {
-            http_close_connection(conn);
-            return -1;
-          }
-        }
-
-        conn->upload_remaining = content_length - in_buf;
-        conn->buffer_used = 0;
-        conn->buffer[0] = '\0';
-
-        if (conn->upload_remaining == 0U) {
-          (void)pal_file_close(conn->upload_fd);
-          conn->upload_fd = -1;
-          conn->upload_active = 0;
-          http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
-          if (resp != NULL) {
-            http_response_add_header(resp, "Content-Type", "application/json");
-            http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
-            const char *body = "{\"ok\":true}";
-            http_response_set_body(resp, body, strlen(body));
-            if (resp->used > 0) {
-              ssize_t wr = write(conn->fd, resp->data, resp->used);
-              (void)wr;
-            }
-            http_response_destroy(resp);
-          }
-          http_close_connection(conn);
-          return -1;
-        }
-
-        return 0;
-      }
-#endif
-
-      if (content_length > 0U) {
-        /*
-         * OVERFLOW-SAFE size check.
-         *
-         * WHY: a malicious client can send
-         *   Content-Length: 18446744073709551615  (SIZE_MAX on 64-bit)
-         * Without the pre-addition guard, (header_len + SIZE_MAX) wraps to
-         * (header_len - 1) via unsigned overflow, which is LESS than the
-         * buffer limit.  Both the "too large" rejection and the "wait for
-         * more data" guard would then pass silently, dispatching a request
-         * to the handler with a fabricated body pointer.
-         *
-         * Fix: reject if content_length alone already exceeds the available
-         * space before performing the addition.  This makes overflow
-         * impossible because after the guard content_length <=
-         * (sizeof(conn->buffer) - 1), and header_len is always < that same
-         * limit (we have already confirmed \r\n\r\n fits inside the buffer).
-         *
-         * @pre  header_len > 0 (guaranteed by the strstr("\r\n\r\n") check)
-         * @post content_length + header_len <= SIZE_MAX (no wrap possible)
-         */
-        const size_t buf_limit = sizeof(conn->buffer) - 1U;
-        if (content_length > buf_limit ||
-            (header_len + content_length) > buf_limit) {
-          http_response_t *resp =
-              http_response_create(HTTP_STATUS_400_BAD_REQUEST);
-          if (resp != NULL) {
-            const char *msg = "Request too large";
-            http_response_set_body(resp, msg, strlen(msg));
-            if (resp->used > 0) {
-              ssize_t wr = write(conn->fd, resp->data, resp->used);
-              (void)wr;
-            }
-            http_response_destroy(resp);
-          }
-          http_close_connection(conn);
-          return -1;
-        }
-
-        if (conn->buffer_used < (header_len + content_length)) {
-          return 0;
-        }
-      }
-
-      (void)http_handle_request(conn);
+    http_request_head_t head;
+    int head_rc = http_peek_request_head(conn->buffer, conn->buffer_used, &head);
+    if (head_rc == -2) return 0;
+    if (head_rc != 0) {
       http_close_connection(conn);
       return -1;
     }
+
+    size_t header_len = head.header_length;
+    size_t content_length = head.content_length;
+
+#if ENABLE_WEB_UPLOAD
+    if (http_upload_matches(&head)) {
+      if (http_upload_start(conn, &head) < 0) {
+        http_close_connection(conn);
+        return -1;
+      }
+      return 0;
+    }
+#endif
+
+    const size_t buf_limit = sizeof(conn->buffer) - 1U;
+    if (content_length > buf_limit || header_len > buf_limit - content_length) {
+      http_response_t *resp = http_response_create(HTTP_STATUS_400_BAD_REQUEST);
+      if (resp != NULL) {
+        static const char msg[] = "Request too large";
+        if (http_response_set_body(resp, msg, sizeof(msg) - 1U) == 0 &&
+            resp->used > 0U)
+          (void)pal_send_all(conn->fd, resp->data, resp->used, 0);
+        http_response_destroy(resp);
+      }
+      http_close_connection(conn);
+      return -1;
+    }
+
+    size_t request_length = header_len + content_length;
+    if (conn->buffer_used < request_length) return 0;
+
+    (void)http_handle_request(conn, request_length);
+    http_close_connection(conn);
+    return -1;
   }
 
   return 0;
 }
 
-/*===========================================================================*
- * HANDLE REQUEST — parse, route, respond
- *===========================================================================*/
 
-static int http_handle_request(http_connection_t *conn) {
+static int http_handle_request(http_connection_t *conn, size_t request_length) {
   http_request_t request;
-  if (http_parse_request(conn->buffer, conn->buffer_used, &request) < 0) {
+  if (http_parse_request(conn->buffer, request_length, &request) < 0)
     return -1;
+
+  if (request.method == HTTP_METHOD_GET &&
+      ((strncmp(request.uri, "/api/file/get", 13) == 0 &&
+        (request.uri[13] == '?' || request.uri[13] == '\0')) ||
+       (strncmp(request.uri, "/api/download", 13) == 0 &&
+        (request.uri[13] == '?' || request.uri[13] == '\0')))) {
+    http_background_request_t *task = calloc(1U, sizeof(*task));
+    if (task != NULL) {
+      task->fd = dup(conn->fd);
+      task->request.method = request.method;
+      (void)snprintf(task->request.uri, sizeof(task->request.uri), "%s",
+                     request.uri);
+      const char *range = http_get_header(&request, "Range");
+      if (range != NULL) {
+        /* Parsed headers point into conn->buffer, which is released as soon
+         * as this handler returns.  Keep the range in the background task. */
+        (void)snprintf(task->range_value, sizeof(task->range_value), "%s",
+                       strlen(range) < sizeof(task->range_value) ? range :
+                                                                 "invalid");
+        memcpy(task->range_name, "Range", sizeof(task->range_name));
+        task->request.headers[0].name = task->range_name;
+        task->request.headers[0].value = task->range_value;
+        task->request.num_headers = 1;
+      }
+      if (task->fd >= 0) {
+        pthread_t tid;
+        pthread_attr_t attr;
+        (void)pthread_attr_init(&attr);
+        (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int rc = pthread_create(&tid, &attr, http_background_file_get, task);
+        (void)pthread_attr_destroy(&attr);
+        if (rc == 0) return 0;
+        close(task->fd);
+      }
+      free(task);
+    }
   }
 
   http_response_t *response = http_api_handle(&request);
   if (response == NULL) {
     response = http_response_create(HTTP_STATUS_500_INTERNAL_ERROR);
-    if (response == NULL) {
-      return -1;
-    }
-    const char *msg = "Internal Server Error";
-    http_response_set_body(response, msg, strlen(msg));
-  }
-
-  /* Send response headers (+ body if no sendfile) */
-  if (response->used > 0) {
-    if (pal_send_all(conn->fd, response->data, response->used, 0) < 0) {
+    if (response == NULL) return -1;
+    static const char message[] = "Internal Server Error";
+    if (http_response_set_body(response, message, sizeof(message) - 1U) != 0) {
       http_response_destroy(response);
       return -1;
     }
   }
 
-  /*
-   *  ┌────────────────────────────────────────────────────┐
-   *  │  MEMORY BODY PATH — stream embedded static assets   │
-   *  └────────────────────────────────────────────────────┘
-   */
-  if ((response->mem_seg_count > 0U) &&
-      (response->mem_seg_index < response->mem_seg_count)) {
-    while (response->mem_seg_index < response->mem_seg_count) {
-      const void *seg = response->mem_segs[response->mem_seg_index];
-      size_t seg_len = response->mem_lens[response->mem_seg_index];
-      if ((seg == NULL) || (seg_len == 0U)) {
-        response->mem_seg_index++;
-        response->mem_seg_sent = 0U;
-        continue;
+  if (request.method == HTTP_METHOD_GET &&
+      strncmp(request.uri, "/api/dump?", 10) == 0 &&
+      response->stream_read != NULL) {
+    http_background_response_t *task = malloc(sizeof(*task));
+    if (task != NULL) {
+      task->fd = dup(conn->fd);
+      task->response = response;
+      if (task->fd >= 0) {
+        pthread_t tid;
+        pthread_attr_t attr;
+        (void)pthread_attr_init(&attr);
+        (void)pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int rc = pthread_create(&tid, &attr, http_background_send, task);
+        (void)pthread_attr_destroy(&attr);
+        if (rc == 0) return 0;
+        close(task->fd);
       }
-      if (response->mem_seg_sent >= seg_len) {
-        response->mem_seg_index++;
-        response->mem_seg_sent = 0U;
-        continue;
-      }
-      const unsigned char *p = (const unsigned char *)seg;
-      const unsigned char *start = p + response->mem_seg_sent;
-      size_t remaining = seg_len - response->mem_seg_sent;
-      if (pal_send_all(conn->fd, start, remaining, 0) < 0) {
-        http_response_destroy(response);
-        return -1;
-      }
-      response->mem_seg_sent = seg_len;
+      free(task);
     }
   }
 
-  if ((response->mem_body != NULL) &&
-      (response->mem_sent < response->mem_length)) {
-    const unsigned char *p = (const unsigned char *)response->mem_body;
-    const unsigned char *start = p + response->mem_sent;
-    size_t remaining = response->mem_length - response->mem_sent;
-    if (pal_send_all(conn->fd, start, remaining, 0) < 0) {
-      http_response_destroy(response);
-      return -1;
-    }
-    response->mem_sent = response->mem_length;
-  }
-
-  /*
-   *  ┌────────────────────────────────────────┐
-   *  │  SENDFILE PATH — stream file content   │
-   *  │  Used by /api/download                 │
-   *  └────────────────────────────────────────┘
-   */
-  /*
-   *  ┌────────────────────────────────────────┐
-   *  │  SENDFILE PATH — stream file content   │
-   *  │  Used by /api/download                 │
-   *  └────────────────────────────────────────┘
-   */
-  if (response->sendfile_fd >= 0) {
-    /*
-     * FILE DOWNLOAD — zero-copy sendfile only.
-     *
-     * pal_sendfile() → DMA from page-cache to NIC.
-     * No fallback path: if the kernel cannot sendfile(2) this fd,
-     * the transfer fails and the connection is closed.
-     *
-     * PS5 EAGAIN QUIRK: chunks >= 1 MB can trigger mbuf starvation
-     * in PS5's FreeBSD kernel, returning EAGAIN with sbytes=0 even
-     * on blocking sockets.  We retry the same chunk after a 1 ms
-     * yield — same strategy as ftp_commands.c cmd_RETR.
-     */
-    off_t  sf_offset    = (off_t)response->sendfile_offset;
-    size_t sf_remaining = response->sendfile_count;
-
-    while (sf_remaining > 0U) {
-      size_t chunk = sf_remaining;
-      if (chunk > (size_t)HTTP_SENDFILE_CHUNK_SIZE) {
-        chunk = (size_t)HTTP_SENDFILE_CHUNK_SIZE;
-      }
-      ssize_t sent = pal_sendfile(conn->fd, response->sendfile_fd,
-                                  &sf_offset, chunk);
-      if (sent < 0) { break; }
-      if (sent == 0) {
-        if (errno == EINTR) { continue; }
-        if (errno == EAGAIN) {
-          /* PS5 mbuf starvation — bounded retry (max 16 attempts, 1 ms each).
-           * Same strategy as ftp_commands.c cmd_RETR but capped to prevent
-           * infinite blocking of the single-threaded event loop.
-           *
-           * Use for(;;) rather than do…while(): continue on EINTR must
-           * jump to the top of the loop body, not the condition check. */
-          int eagain_retries = 0;
-          for (;;) {
-            usleep(1000); /* 1 ms — let mbuf drain */
-            sent = pal_sendfile(conn->fd, response->sendfile_fd,
-                                &sf_offset, chunk);
-            if (sent > 0) { break; }           /* recovered */
-            if (sent < 0) { break; }           /* fatal — handled below */
-            if (errno == EINTR) { continue; }  /* restart, don't count */
-            if (errno != EAGAIN) { break; }    /* unexpected errno — bail */
-            if (++eagain_retries >= 16) { break; }
-          }
-          if (sent > 0) {
-            sf_remaining -= (size_t)sent;
-            continue;
-          }
-          break;
-        }
-        break;
-      }
-      sf_remaining -= (size_t)sent;
-    }
-
-    close(response->sendfile_fd);
-    response->sendfile_fd = -1;
-  }
-
-  /*
-   *  ┌─────────────────────────────────────────────────────────┐
-   *  │  CHUNKED STREAMING — for large directories (/api/list)  │
-   *  └─────────────────────────────────────────────────────────┘
-   */
-  if (response->stream_dir != NULL) {
-    DIR *dir = (DIR *)response->stream_dir;
-    struct dirent *entry;
-    char buffer[4096];
-    int first = 1;
-
-    /*
-     * Iterate over directory entries and send them as chunks.
-     * We don't need a huge buffer; we just send one entry at a time.
-     */
-    while ((entry = readdir(dir)) != NULL) {
-      if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-        continue;
-      }
-      if ((strcmp(response->stream_path, "/") == 0) &&
-          ((strcmp(entry->d_name, "dev") == 0) ||
-           (strcmp(entry->d_name, "proc") == 0) ||
-           (strcmp(entry->d_name, "sys") == 0) ||
-           (strcmp(entry->d_name, "kern") == 0))) {
-        continue;
-      }
-
-      char fullpath[2048];
-      int max_stream = (int)(sizeof(fullpath) - 2 - strlen(entry->d_name));
-      if (max_stream < 0) { continue; }
-      snprintf(fullpath, sizeof(fullpath), "%.*s/%s", max_stream,
-               response->stream_path,
-               entry->d_name);
-
-      struct stat st;
-      if (stat(fullpath, &st) < 0) {
-        continue;
-      }
-
-      /* Format JSON entry: ,{"name":"...","type":"...","size":...} */
-      size_t pos = 0;
-      if (!first) {
-        buffer[pos++] = ',';
-      }
-      first = 0;
-
-      pos +=
-          (size_t)snprintf(buffer + pos, sizeof(buffer) - pos, "{\"name\":\"");
-
-      /* Simple escaping for now — relying on snprintf not to overflow */
-      for (const char *p = entry->d_name; *p && pos < sizeof(buffer) - 64;
-           p++) {
-        if (*p == '"' || *p == '\\') {
-          buffer[pos++] = '\\';
-        }
-        buffer[pos++] = *p;
-      }
-
-      long long entry_size = S_ISDIR(st.st_mode)
-                             ? (long long)st.st_blocks * 512LL
-                             : (long long)st.st_size;
-      pos += (size_t)snprintf(buffer + pos, sizeof(buffer) - pos,
-                              "\",\"type\":\"%s\",\"size\":%lld}",
-                              S_ISDIR(st.st_mode) ? "directory" : "file",
-                              entry_size);
-
-      /* Send chunk: <hex-len>\r\n<data>\r\n */
-      char chunk_header[32];
-      int header_len =
-          snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n", pos);
-
-      if (pal_send_all(conn->fd, chunk_header, (size_t)header_len, 0) < 0)
-        break;
-      if (pal_send_all(conn->fd, buffer, pos, 0) < 0)
-        break;
-      if (pal_send_all(conn->fd, "\r\n", 2, 0) < 0)
-        break;
-    }
-
-    closedir(dir);
-    response->stream_dir = NULL;
-
-    /* Send closing JSON: ]} */
-    const char *closer = "]}";
-    size_t closer_len = strlen(closer);
-    char chunk_header[32];
-    int header_len =
-        snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n", closer_len);
-    (void)pal_send_all(conn->fd, chunk_header, (size_t)header_len, 0);
-    (void)pal_send_all(conn->fd, closer, closer_len, 0);
-    (void)pal_send_all(conn->fd, "\r\n", 2, 0);
-
-    /* End of stream: 0\r\n\r\n */
-    (void)pal_send_all(conn->fd, "0\r\n\r\n", 5, 0);
-  }
-
+  int result = http_response_stream_send(conn->fd, response,
+                                          request.method != HTTP_METHOD_HEAD);
   http_response_destroy(response);
-  return 0;
+  return result;
 }
 
-/*===========================================================================*
- * CLOSE CONNECTION — cleanup resources
- *===========================================================================*/
 
 static void http_close_connection(http_connection_t *conn) {
   if (conn == NULL) {
@@ -1606,5 +386,5 @@ static void http_close_connection(http_connection_t *conn) {
   if (fd >= 0) {
     close(fd);
   }
-  http_connection_release(conn);
+  http_server_connection_release(conn);
 }

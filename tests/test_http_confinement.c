@@ -21,6 +21,7 @@
 
 #include "ftp_path.h"
 #include "http_api.h"
+#include "../src/http/http_api_internal.h"
 #include "http_csrf.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,43 +43,6 @@
   do {                                                                         \
     fprintf(stderr, "  PASS test %d\n", (n));                                  \
   } while (0)
-
-/**
- * @brief Test if a path is confined to root using the same pipeline
- *        as http_api.c: ftp_path_normalize -> ftp_path_is_within_root
- *
- * @return 0 if confined, -1 if escapes root
- */
-static int test_confine(const char *input, const char *root, char *out,
-                        size_t out_size) {
-  char normalized[FTP_PATH_MAX];
-  if (ftp_path_normalize(input, normalized, sizeof(normalized)) != FTP_OK) {
-    return -1;
-  }
-  if (ftp_path_is_within_root(normalized, root) != 1) {
-    return -1;
-  }
-
-  /* Resolve symlinks if possible */
-  char real[FTP_PATH_MAX];
-  if (realpath(normalized, real) != NULL) {
-    if (ftp_path_is_within_root(real, root) != 1) {
-      return -1;
-    }
-    size_t n = strlen(real);
-    if ((n + 1U) > out_size) {
-      return -1;
-    }
-    memcpy(out, real, n + 1U);
-  } else {
-    size_t n = strlen(normalized);
-    if ((n + 1U) > out_size) {
-      return -1;
-    }
-    memcpy(out, normalized, n + 1U);
-  }
-  return 0;
-}
 
 /*===========================================================================*
  *  MAIN
@@ -127,7 +91,7 @@ int main(void) {
   {
     char path[FTP_PATH_MAX];
     (void)snprintf(path, sizeof(path), "%s/files", root_real);
-    if (test_confine(path, root_real, out, sizeof(out)) != 0) {
+    if (http_api_validate_path(path, out, sizeof(out)) != 1) {
       FAIL(1, "legitimate path rejected");
     }
     PASS(1);
@@ -137,7 +101,7 @@ int main(void) {
   {
     char path[FTP_PATH_MAX];
     (void)snprintf(path, sizeof(path), "%s/../..", root_real);
-    if (test_confine(path, root_real, out, sizeof(out)) == 0) {
+    if (http_api_validate_path(path, out, sizeof(out)) != 0) {
       FAIL(2, "traversal path accepted");
     }
     PASS(2);
@@ -147,7 +111,7 @@ int main(void) {
   {
     char path[FTP_PATH_MAX];
     (void)snprintf(path, sizeof(path), "%s///../..", root_real);
-    if (test_confine(path, root_real, out, sizeof(out)) == 0) {
+    if (http_api_validate_path(path, out, sizeof(out)) != 0) {
       FAIL(3, "double-slash traversal accepted");
     }
     PASS(3);
@@ -157,7 +121,7 @@ int main(void) {
   {
     char path[FTP_PATH_MAX];
     (void)snprintf(path, sizeof(path), "%s/escape", root_real);
-    if (test_confine(path, root_real, out, sizeof(out)) == 0) {
+    if (http_api_validate_path(path, out, sizeof(out)) != 0) {
       FAIL(4, "symlink escape accepted");
     }
     PASS(4);
@@ -165,7 +129,7 @@ int main(void) {
 
   /*-- TEST 5: Absolute path outside root --*/
   {
-    if (test_confine("/etc/passwd", root_real, out, sizeof(out)) == 0) {
+    if (http_api_validate_path("/etc/passwd", out, sizeof(out)) != 0) {
       FAIL(5, "absolute outside path accepted");
     }
     PASS(5);
@@ -173,7 +137,8 @@ int main(void) {
 
   /*-- TEST 6: Root "/" permits everything --*/
   {
-    if (test_confine("/etc/passwd", "/", out, sizeof(out)) != 0) {
+    http_api_set_root("/");
+    if (http_api_validate_path("/etc/passwd", out, sizeof(out)) != 1) {
       FAIL(6, "root '/' rejected a valid path");
     }
     PASS(6);

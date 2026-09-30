@@ -20,6 +20,7 @@ static const http_domain_handler_t k_api_domains[] = {
     http_games_metadata_handle,
     http_api_archive_handle,
     http_games_admin_handle,
+    http_api_dump_handle,
 };
 
 static http_response_t *legacy_api_handle(const http_request_t *request) {

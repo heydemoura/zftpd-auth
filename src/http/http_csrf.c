@@ -45,13 +45,7 @@ int http_csrf_init(void) {
   g_csrf_initialized = 0;
   int fd = open("/dev/urandom", O_RDONLY);
   if (fd < 0) {
-    /*
-     * VULN-03 fix: fail hard instead of falling back to a
-     * predictable token.  Empty token -> all uploads rejected.
-     *
-     *   BEFORE:  snprintf(g_csrf_token, ..., "0123456789abcdef...");
-     *   AFTER:   g_csrf_token[0] = '\0';   (all requests fail)
-     */
+    /* Entropy failure is terminal: never issue a predictable token. */
     g_csrf_token[0] = '\0';
     return -1;
   }
@@ -92,10 +86,7 @@ int http_csrf_validate(const http_request_t *req) {
     return -1;
   }
 
-  /*
-   * Phase 1.2: use explicit initialization flag instead of
-   * testing token emptiness.  More readable and unforgeable.
-   */
+  /* An uninitialized token rejects every upload. */
   if (g_csrf_initialized == 0) {
     return -1;
   }

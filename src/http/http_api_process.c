@@ -75,7 +75,7 @@ static http_response_t *api_processes(const http_request_t *request) {
 
           pos += (size_t)snprintf(body + pos, cap - pos,
                                   "{\"pid\":%d,\"name\":\"", (int)pid);
-          (void)http_api_json_escape_append(body, cap, &pos, name);
+          (void)http_json_escape_append(body, cap, &pos, name);
           pos += (size_t)snprintf(
               body + pos, cap - pos,
               "\",\"user\":\"%u\",\"cpu\":0.0,\"mem_mb\":%" PRIu64
@@ -175,7 +175,7 @@ static http_response_t *api_processes(const http_request_t *request) {
 
       pos += (size_t)snprintf(body + pos, cap - pos, "{\"pid\":%d,\"name\":\"",
                               pid);
-      (void)http_api_json_escape_append(body, cap, &pos, comm);
+      (void)http_json_escape_append(body, cap, &pos, comm);
       pos += (size_t)snprintf(
           body + pos, cap - pos,
           "\",\"user\":\"%u\",\"cpu\":%.1f,\"mem_mb\":%" PRIu64

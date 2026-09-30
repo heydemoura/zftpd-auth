@@ -50,6 +50,8 @@ static const char *status_text(http_status_t status) {
     return "Created";
   case HTTP_STATUS_204_NO_CONTENT:
     return "No Content";
+  case HTTP_STATUS_206_PARTIAL_CONTENT:
+    return "Partial Content";
   /* 3xx */
   case HTTP_STATUS_301_MOVED:
     return "Moved Permanently";
@@ -68,6 +70,8 @@ static const char *status_text(http_status_t status) {
     return "Conflict";
   case HTTP_STATUS_415_UNSUPPORTED_MEDIA_TYPE:
     return "Unsupported Media Type";
+  case HTTP_STATUS_416_RANGE_NOT_SATISFIABLE:
+    return "Range Not Satisfiable";
   /* 5xx */
   case HTTP_STATUS_500_INTERNAL_ERROR:
     return "Internal Server Error";
@@ -146,6 +150,16 @@ void http_response_destroy(http_response_t *resp) {
   if (resp->stream_dir != NULL) {
     closedir((DIR *)resp->stream_dir);
     resp->stream_dir = NULL;
+  }
+  if (resp->stream_close != NULL) {
+    if (resp->stream_result != NULL) {
+      resp->stream_result(resp->stream_ctx, -1);
+      resp->stream_result = NULL;
+    }
+    resp->stream_close(resp->stream_ctx);
+    resp->stream_close = NULL;
+    resp->stream_read = NULL;
+    resp->stream_ctx = NULL;
   }
   if (resp->mem_body_owned && resp->mem_body != NULL) {
     void *tmp;
