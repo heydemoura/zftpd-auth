@@ -139,6 +139,21 @@ ftp_error_t pal_network_reinit(void) {
  * SOCKET CONFIGURATION
  *===========================================================================*/
 
+void pal_socket_set_nosigpipe(socket_t fd) {
+  if (fd < 0) {
+    return;
+  }
+#if defined(SO_NOSIGPIPE)
+  {
+    int one = 1;
+    (void)PAL_SETSOCKOPT(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  }
+#else
+  /* Linux has no such option: install_signal_handlers() ignores SIGPIPE for
+   * the whole process instead. */
+#endif
+}
+
 /**
  * @brief Configure socket for optimal performance
  */
@@ -149,6 +164,9 @@ ftp_error_t pal_socket_configure(socket_t fd) {
   if (fd < 0) {
     return FTP_ERR_INVALID_PARAM;
   }
+
+  /* A client that disappears mid-transfer must not kill the daemon. */
+  pal_socket_set_nosigpipe(fd);
 
 #if FTP_TCP_NODELAY
   /* Disable Nagle's algorithm (reduce latency) */
@@ -277,6 +295,9 @@ ftp_error_t pal_socket_configure_data(socket_t fd) {
   if (fd < 0) {
     return FTP_ERR_INVALID_PARAM;
   }
+
+  /* A client that disappears mid-transfer must not kill the daemon. */
+  pal_socket_set_nosigpipe(fd);
 
   /*----------- Nagle ON for bulk coalescing ----------------*/
   {

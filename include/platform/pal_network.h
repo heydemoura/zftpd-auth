@@ -324,6 +324,21 @@ ftp_error_t pal_socket_set_blocking(socket_t fd);
 ftp_error_t pal_socket_set_reuseaddr(socket_t fd);
 
 /**
+ * @brief Suppress SIGPIPE when a write hits a closed peer
+ *
+ * FreeBSD (PS4/PS5) and Darwin raise SIGPIPE when a socket write finds the
+ * connection gone, and the default disposition kills the process: a download
+ * aborted from the browser (or an FTP client that drops the data connection)
+ * would take the whole daemon down.  Platforms without the socket option rely
+ * on the process-wide SIGPIPE ignore instead.
+ *
+ * @param fd Socket file descriptor
+ *
+ * @note Best-effort: a failure leaves the process-wide disposition in charge.
+ */
+void pal_socket_set_nosigpipe(socket_t fd);
+
+/**
  * @brief Cork data socket (hold TCP segments for coalescing)
  *
  * Call before a burst of small sends (e.g. sendfile loop).
