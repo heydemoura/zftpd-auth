@@ -1,6 +1,7 @@
 #include "games_internal.h"
 #include "../http_api_internal.h"
 #include "ftp_config.h"
+#include "pal_limits.h"
 #include "exfat_unpacker.h"
 #include "pkg_unpacker.h"
 #include <stdio.h>
@@ -15,7 +16,7 @@
 
 static http_response_t *api_game_meta(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "/";
+  char path[PAL_PATH_MAX] = "/";
   if (query) (void)http_api_parse_path_param(query, path, sizeof(path));
 
   char safe[FTP_PATH_MAX];
@@ -229,7 +230,7 @@ static http_response_t *api_game_meta(const http_request_t *request) {
 
 static http_response_t *api_game_icon(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
-  char path[1024] = "/";
+  char path[PAL_PATH_MAX] = "/";
   if (query) (void)http_api_parse_path_param(query, path, sizeof(path));
 
   char safe[FTP_PATH_MAX];

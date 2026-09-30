@@ -1,4 +1,5 @@
 #include "games_internal.h"
+#include "http_config.h" /* HTTP_DEFAULT_PORT */
 #include "../http_api_internal.h"
 #include "ftp_config.h"
 #include <ctype.h>
@@ -25,7 +26,7 @@ static http_response_t *api_games_installed(const http_request_t *request) {
   }
 
   size_t pos = 0U;
-  if (http_api_buf_append_cstr(body, GAMES_BODY_CAP, &pos,
+  if (http_buf_append_cstr(body, GAMES_BODY_CAP, &pos,
                       "{\"ok\":true,\"entries\":[") != 0) {
     free(body);
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
@@ -44,7 +45,7 @@ static http_response_t *api_games_installed(const http_request_t *request) {
     }
   }
 
-  if (http_api_buf_append_cstr(body, GAMES_BODY_CAP, &pos, "]}") != 0) {
+  if (http_buf_append_cstr(body, GAMES_BODY_CAP, &pos, "]}") != 0) {
     free(body);
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Response too large");
   }
@@ -67,7 +68,7 @@ static http_response_t *api_games_installed(const http_request_t *request) {
 static http_response_t *api_games_icon(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
   if (query == NULL) {
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
 
   char title_id[64] = {0};
@@ -85,53 +86,71 @@ static http_response_t *api_games_icon(const http_request_t *request) {
     }
   }
 
+  /*
+   * The app-directory hint only shortens the lookup: an unusable one is
+   * dropped and resolution falls back to the per-title appmeta paths.
+   *
+   * Every failure answers 404 so the browser fires onerror and the UI can
+   * draw its placeholder; a "200 + 1x1 transparent PNG" made every failed
+   * icon look like an empty box with no way to tell the two apart.
+   */
   char path_hint[FTP_PATH_MAX] = {0};
-  (void)http_api_parse_query_param(query, "path", path_hint, sizeof(path_hint));
+  char path_param[FTP_PATH_MAX] = {0};
+  if ((http_api_parse_query_param(query, "path", path_param,
+                                  sizeof(path_param)) == 0) &&
+      (path_param[0] != '\0')) {
+    char safe[FTP_PATH_MAX];
+    if (http_api_validate_path(path_param, safe, sizeof(safe))) {
+      (void)snprintf(path_hint, sizeof(path_hint), "%s", safe);
+    }
+  }
 
   char icon_path[FTP_PATH_MAX] = {0};
   if (games_resolve_installed_icon((title_id[0] != '\0') ? title_id : NULL,
                                   (path_hint[0] != '\0') ? path_hint : NULL,
                                   icon_path, sizeof(icon_path)) != 0) {
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
 
   FILE *fp = fopen(icon_path, "rb");
   if (fp == NULL) {
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
   if (fseek(fp, 0, SEEK_END) != 0) {
     fclose(fp);
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
   long flen = ftell(fp);
   if (flen <= 0 || flen > (8 * 1024 * 1024)) {
     fclose(fp);
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
   if (fseek(fp, 0, SEEK_SET) != 0) {
     fclose(fp);
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
 
   uint8_t *buf = (uint8_t *)malloc((size_t)flen);
   if (buf == NULL) {
     fclose(fp);
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
   }
   size_t got = fread(buf, 1, (size_t)flen, fp);
   fclose(fp);
   if (got != (size_t)flen) {
     free(buf);
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "Icon not found");
   }
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
   http_response_add_header(resp, "Content-Type", "image/png");
-  http_response_add_header(resp, "Cache-Control", "no-store");
+  /* Icons are fetched once per title and do not change while installed. */
+  http_response_add_header(resp, "Cache-Control", "public, max-age=300");
   if (http_response_set_body_owned(resp, buf, got) != 0) {
     free(buf);
     http_response_destroy(resp);
-    return http_api_png_fallback_response();
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                               "Body allocation failed");
   }
   return resp;
 }
@@ -155,7 +174,7 @@ static http_response_t *api_games_repair_visibility(const http_request_t *reques
     }
   }
 
-  if (http_api_buf_append_cstr(body, sizeof(body), &pos,
+  if (http_buf_append_cstr(body, sizeof(body), &pos,
                       "{\"ok\":true,\"message\":\"Visibility reindex completed\",\"scanned\":[") !=
       0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR, "Out of memory");
@@ -243,12 +262,12 @@ static http_response_t *api_games_repair_visibility(const http_request_t *reques
 
   for (size_t i = 0; bases[i] != NULL; i++) {
     if (!first) {
-      (void)http_api_buf_append_cstr(body, sizeof(body), &pos, ",");
+      (void)http_buf_append_cstr(body, sizeof(body), &pos, ",");
     }
     first = 0;
-    (void)http_api_buf_append_cstr(body, sizeof(body), &pos, "\"");
-    (void)http_api_json_escape_append(body, sizeof(body), &pos, bases[i]);
-    (void)http_api_buf_append_cstr(body, sizeof(body), &pos, "\"");
+    (void)http_buf_append_cstr(body, sizeof(body), &pos, "\"");
+    (void)http_json_escape_append(body, sizeof(body), &pos, bases[i]);
+    (void)http_buf_append_cstr(body, sizeof(body), &pos, "\"");
 
     DIR *d = opendir(bases[i]);
     if (d != NULL) {
@@ -263,48 +282,48 @@ static http_response_t *api_games_repair_visibility(const http_request_t *reques
     }
   }
 
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, "],\"items_seen\":");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, "],\"items_seen\":");
   {
     char num[32];
     int n = snprintf(num, sizeof(num), "%zu", count_added);
     if (n > 0 && (size_t)n < sizeof(num)) {
-      (void)http_api_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
+      (void)http_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
     }
   }
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, ",\"hints\":[");
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos,
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, ",\"hints\":[");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos,
                         "\"Use Refresh Installed in Games tab\",");
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos,
+  (void)http_buf_append_cstr(body, sizeof(body), &pos,
                         "\"If titles still missing, restart shell/console\"");
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, "],\"sqlite_repair\":{");
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, "\"available\":");
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos,
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, "],\"sqlite_repair\":{");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, "\"available\":");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos,
                         sqlite_available ? "true" : "false");
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, ",\"titles\":");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, ",\"titles\":");
   {
     char num[32];
     int n = snprintf(num, sizeof(num), "%d", repaired_titles);
     if (n > 0 && (size_t)n < sizeof(num)) {
-      (void)http_api_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
+      (void)http_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
     }
   }
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, ",\"tables\":");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, ",\"tables\":");
   {
     char num[32];
     int n = snprintf(num, sizeof(num), "%d", repaired_tables);
     if (n > 0 && (size_t)n < sizeof(num)) {
-      (void)http_api_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
+      (void)http_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
     }
   }
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, ",\"rows\":");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, ",\"rows\":");
   {
     char num[32];
     int n = snprintf(num, sizeof(num), "%d", repaired_rows);
     if (n > 0 && (size_t)n < sizeof(num)) {
-      (void)http_api_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
+      (void)http_buf_append_bytes(body, sizeof(body), &pos, num, (size_t)n);
     }
   }
-  (void)http_api_buf_append_cstr(body, sizeof(body), &pos, "}}");
+  (void)http_buf_append_cstr(body, sizeof(body), &pos, "}}");
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
   http_response_add_header(resp, "Content-Type", "application/json");
@@ -318,18 +337,50 @@ static http_response_t *api_games_install_status(const http_request_t *request) 
   games_install_snapshot_t state;
   (void)games_install_state_refresh(&state);
 
-  char body[768];
-  int n = snprintf(
-      body, sizeof(body),
-      "{\"ok\":true,\"active\":%s,\"task_id\":%d,\"progress\":%d,\"error\":%d,\"length\":%lu,\"transferred\":%lu,\"title_id\":\"%s\",\"path\":\"%s\"}",
-      state.active ? "true" : "false", state.task_id, state.last_percent,
-      state.last_error, state.last_length, state.last_transferred, state.title_id,
-      state.path);
-
+  const size_t capacity = FTP_PATH_MAX * 6U + 2048U;
+  char *body = malloc(capacity);
+  if (body == NULL) return NULL;
+  size_t pos = 0U;
+  int valid =
+      http_buf_append_cstr(body, capacity, &pos, "{\"ok\":true,\"active\":") == 0 &&
+      http_buf_append_cstr(body, capacity, &pos,
+                           state.active ? "true" : "false") == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"task_id\":") == 0 &&
+      http_buf_append_i32(body, capacity, &pos, state.task_id) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"progress\":") == 0 &&
+      http_buf_append_i32(body, capacity, &pos, state.last_percent) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"error\":") == 0 &&
+      http_buf_append_i32(body, capacity, &pos, state.last_error) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"length\":") == 0 &&
+      http_buf_append_u64(body, capacity, &pos, state.last_length) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"transferred\":") == 0 &&
+      http_buf_append_u64(body, capacity, &pos, state.last_transferred) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"title_id\":\"") == 0 &&
+      http_json_escape_append(body, capacity, &pos, state.title_id) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, "\",\"path\":\"") == 0 &&
+      http_json_escape_append(body, capacity, &pos, state.path) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, "\",\"detail\":\"") == 0 &&
+      http_json_escape_append(body, capacity, &pos, state.detail) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, "\",\"needs_confirm\":") == 0 &&
+      http_buf_append_cstr(body, capacity, &pos,
+                           state.needs_confirm ? "true" : "false") == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"slot\":") == 0 &&
+      http_buf_append_i32(body, capacity, &pos, state.slot) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, "}") == 0;
+  if (!valid) {
+    free(body);
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                               "Install status is too large");
+  }
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  if (resp == NULL) { free(body); return NULL; }
   http_response_add_header(resp, "Content-Type", "application/json");
   http_response_add_header(resp, "Cache-Control", "no-store");
-  http_response_set_body(resp, body, (size_t)n);
+  if (http_response_set_body_owned(resp, body, pos) != 0) {
+    free(body);
+    http_response_destroy(resp);
+    return NULL;
+  }
   return resp;
 }
 
@@ -375,6 +426,49 @@ static http_response_t *api_games_uninstall(const http_request_t *request) {
 #endif
 }
 
+#if ENABLE_PKG_INSTALL && \
+    (defined(PLATFORM_PS4) || defined(PLATFORM_PS5))
+/**
+ * Decodes a percent-encoded query value in place.
+ */
+static void games_url_decode(char *value) {
+  char *out = value;
+  for (const char *in = value; *in != '\0'; in++) {
+    if (*in == '%' && isxdigit((unsigned char)in[1]) && isxdigit((unsigned char)in[2])) {
+      char hex[3] = {in[1], in[2], '\0'};
+      *out++ = (char)strtol(hex, NULL, 16);
+      in += 2;
+    } else if (*in == '+') {
+      *out++ = ' ';
+    } else {
+      *out++ = *in;
+    }
+  }
+  *out = '\0';
+}
+
+/**
+ * Percent-encodes a filesystem path so it can ride inside a query string.
+ */
+static void games_url_encode_path(const char *in, char *out, size_t out_size) {
+  static const char *hex = "0123456789ABCDEF";
+  size_t o = 0U;
+  for (size_t i = 0U; in[i] != '\0' && (o + 4U) < out_size; i++) {
+    unsigned char ch = (unsigned char)in[i];
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' ||
+        ch == '/') {
+      out[o++] = (char)ch;
+    } else {
+      out[o++] = '%';
+      out[o++] = hex[ch >> 4];
+      out[o++] = hex[ch & 0x0FU];
+    }
+  }
+  out[o] = '\0';
+}
+#endif /* ENABLE_PKG_INSTALL */
+
 static http_response_t *api_games_install(const http_request_t *request) {
 #if !ENABLE_PKG_INSTALL
   (void)request;
@@ -391,35 +485,156 @@ static http_response_t *api_games_install(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
+  /*
+   * Source: a package already on the console (path) or a link the installer
+   * pulls by itself (url).  Nothing is uploaded first - the console downloads
+   * the package as part of installing it, and the task shows up in transfers.
+   */
+  char source_url[768] = {0};
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
+  const char *url_param = strstr(query, "url=");
+  if (url_param != NULL) {
+    url_param += 4;
+    size_t n = strcspn(url_param, "&");
+    if (n >= sizeof(source_url)) {
+      n = sizeof(source_url) - 1U;
+    }
+    memcpy(source_url, url_param, n);
+    source_url[n] = '\0';
+    games_url_decode(source_url);
+    if (strncmp(source_url, "http://", 7) != 0 &&
+        strncmp(source_url, "https://", 8) != 0) {
+      return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
+                                 "Install links must be http or https");
+    }
+  }
+#endif
+
   char path[FTP_PATH_MAX] = {0};
-  if (http_api_parse_path_param(query, path, sizeof(path)) != 0) {
-    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing path parameter");
-  }
+  char safe[FTP_PATH_MAX] = {0};
+  if (source_url[0] == '\0') {
+    if (http_api_parse_path_param(query, path, sizeof(path)) != 0) {
+      return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
+                                 "Missing path or url parameter");
+    }
 
-  char safe[FTP_PATH_MAX];
-  if (!http_api_validate_path(path, safe, sizeof(safe))) {
-    return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Path traversal blocked");
-  }
+    if (!http_api_validate_path(path, safe, sizeof(safe))) {
+      return http_api_error_json(HTTP_STATUS_403_FORBIDDEN, "Path traversal blocked");
+    }
 
-  if (!games_has_pkg_extension(safe)) {
-    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
-                      "Install supports only PKG/FPKG files");
+    if (!games_has_pkg_extension(safe)) {
+      return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
+                        "Install supports only PKG/FPKG files");
+    }
+    struct stat package_stat;
+    if (stat(safe, &package_stat) != 0 || !S_ISREG(package_stat.st_mode) ||
+        package_stat.st_size <= 0) {
+      return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
+                                 "Package file is missing or empty");
+    }
   }
 
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
+  games_install_snapshot_t current_install;
+  (void)games_install_state_refresh(&current_install);
+  if (current_install.active) {
+    return http_api_error_json(HTTP_STATUS_409_CONFLICT,
+                               "A package installation is already running");
+  }
   int install_rc = -1;
   int task_id = -1;
   char title_id[64] = {0};
-  if (games_psx_install_bgft(safe, "Remote PKG Install", title_id,
-                           sizeof(title_id), &task_id,
-                           &install_rc) == 0) {
+  int overwrite = (strstr(query, "overwrite=1") != NULL) ? 1 : 0;
+
+  /*
+   * Replacing an installation destroys data, so it is never implicit: when the
+   * package is already installed the caller is told, and only a request that
+   * says so explicitly goes through (the interface asks the user first).
+   */
+  if (safe[0] != '\0' &&
+      games_psx_pkg_title_id(safe, title_id, sizeof(title_id)) == 0 &&
+      title_id[0] != '\0') {
+    char app_dir[FTP_PATH_MAX];
+    if (games_resolve_installed_app_dir(title_id, app_dir, sizeof(app_dir)) == 0) {
+      if (!overwrite) {
+        char body[384];
+        int n = snprintf(body, sizeof(body),
+                         "{\"ok\":false,\"error\":\"already_installed\","
+                         "\"title_id\":\"%s\",\"message\":\"%s is already "
+                         "installed\",\"can_overwrite\":true}",
+                         title_id, title_id);
+        http_response_t *conflict = http_response_create(HTTP_STATUS_409_CONFLICT);
+        if (conflict == NULL) {
+          return NULL;
+        }
+        http_response_add_header(conflict, "Content-Type", "application/json");
+        http_response_set_body(conflict, (const uint8_t *)body, (size_t)n);
+        return conflict;
+      }
+
+      /* Let the system installer decide whether replacement is supported.
+       * Removing a working title before validating its replacement would
+       * leave the console without either version if the PKG is rejected. */
+    }
+  }
+
+  /* Destination: internal storage unless the caller asks for extended. */
+  int slot = (strstr(query, "dest=extended") != NULL) ? 1 : 0;
+#if defined(PLATFORM_PS5)
+  if (slot != 0) {
+    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
+        "PS5 system installer does not expose an extended-storage selection");
+  }
+#endif
+
+  /*
+   * BGFT downloads the package, so a file living on console storage is served
+   * by this same server over loopback: the payload never holds the bytes.
+   * The port comes from the request, falling back to the configured default.
+   */
+  /* The installer is on the same console: loop back to this server. */
+  const int port = HTTP_DEFAULT_PORT;
+
+  char encoded[FTP_PATH_MAX * 2U];
+  char content_url[FTP_PATH_MAX * 2U + sizeof(source_url)];
+  if (source_url[0] != '\0') {
+    (void)snprintf(content_url, sizeof(content_url), "%s", source_url);
+  } else {
+    games_url_encode_path(safe, encoded, sizeof(encoded));
+    (void)snprintf(content_url, sizeof(content_url),
+                   "http://127.0.0.1:%d/api/file/get?path=%s", port, encoded);
+  }
+
+  /* Uploads staged by the web interface are disposable, user files are not. */
+#if defined(PLATFORM_PS4)
+  int delete_source = (safe[0] != '\0' &&
+                       strncmp(safe, "/data/zftpd/pkg/", 16) == 0) ? 1 : 0;
+#endif
+
+#if defined(PLATFORM_PS5)
+#if defined(ZFTPD_INSTALL_HELPER)
+  if (games_ps5_helper_install(content_url,
+                               (safe[0] != '\0') ? safe : NULL,
+                               slot, overwrite, title_id,
+                               sizeof(title_id), &task_id,
+                               &install_rc) != 0) {
+    return http_api_status_json_200(0, "PS5 installer helper unavailable", -1);
+  }
+#else
+  return http_api_status_json_200(0, "PS5 installer helper not built", -1);
+#endif
+#else
+  if (games_psx_install_bgft(content_url, "Remote PKG Install", slot,
+                             delete_source, title_id,
+                             sizeof(title_id), &task_id,
+                             &install_rc) == 0) {
     if (install_rc == 0 && task_id >= 0) {
       games_install_state_begin(task_id, title_id[0] ? title_id : "", safe);
     }
-  } else if (games_psx_install_path(safe, title_id, sizeof(title_id),
-                                  &install_rc) != 0) {
-    return http_api_status_json_200(0, "Install API unavailable", -1);
+  } else {
+    return http_api_status_json_200(0, "PS4 BGFT installer unavailable", -1);
   }
+#endif
   if (install_rc < 0) {
     char msg[96];
     (void)snprintf(msg, sizeof(msg), "Install failed: 0x%08X",
@@ -427,15 +642,30 @@ static http_response_t *api_games_install(const http_request_t *request) {
     return http_api_status_json_200(0, msg, install_rc);
   }
 
-    char body[512];
-  int n = snprintf(
-      body, sizeof(body),
-      "{\"ok\":true,\"message\":\"Install started\",\"title_id\":\"%s\",\"path\":\"%s\",\"task_id\":%d,\"task_based\":%s}",
-      title_id[0] ? title_id : "", safe, task_id,
-      (task_id >= 0) ? "true" : "false");
+  const size_t capacity = FTP_PATH_MAX * 6U + 512U;
+  char *body = malloc(capacity);
+  if (body == NULL) return NULL;
+  size_t pos = 0U;
+  int valid =
+      http_buf_append_cstr(body, capacity, &pos,
+          "{\"ok\":true,\"message\":\"Install started\",\"title_id\":\"") == 0 &&
+      http_json_escape_append(body, capacity, &pos, title_id) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, "\",\"path\":\"") == 0 &&
+      http_json_escape_append(body, capacity, &pos, safe) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, "\",\"task_id\":") == 0 &&
+      http_buf_append_i32(body, capacity, &pos, task_id) == 0 &&
+      http_buf_append_cstr(body, capacity, &pos, ",\"task_based\":") == 0 &&
+      http_buf_append_cstr(body, capacity, &pos,
+                           task_id >= 0 ? "true}" : "false}") == 0;
+  if (!valid) { free(body); return NULL; }
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
+  if (resp == NULL) { free(body); return NULL; }
   http_response_add_header(resp, "Content-Type", "application/json");
-  http_response_set_body(resp, body, (size_t)n);
+  if (http_response_set_body_owned(resp, body, pos) != 0) {
+    free(body);
+    http_response_destroy(resp);
+    return NULL;
+  }
   return resp;
 #else
   (void)safe;
@@ -489,7 +719,7 @@ static http_response_t *api_games_reinstall(const http_request_t *request) {
   int install_rc = -1;
   int task_id = -1;
   char install_title[64] = {0};
-  if (games_psx_install_bgft(safe, "Remote PKG Reinstall", install_title,
+  if (games_psx_install_bgft(safe, "Remote PKG Reinstall", 0, 0, install_title,
                            sizeof(install_title), &task_id,
                            &install_rc) == 0) {
     if (install_rc == 0 && task_id >= 0) {

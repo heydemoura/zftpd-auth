@@ -1,6 +1,7 @@
 #include "games_internal.h"
 #include "ftp_config.h"
 #include <stdint.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,6 +33,7 @@ typedef struct {
 #endif
 
 static games_install_snapshot_t g_game_install_state = {0};
+static pthread_mutex_t g_game_install_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
 typedef int (*fn_sceAppInstUtilInitialize_t)(void);
@@ -114,8 +116,20 @@ static int psx_bgft_ensure_initialized(fn_sceBgftServiceInit_t f_bgft_init) {
 }
 
 #if ENABLE_PKG_INSTALL
+/*
+ * Title id of a package file.
+ *
+ * Only PS4 asks the system installer for it: on PS5 that call has to come from
+ * a process the loader spawned, and asking from here leaves the request hanging.
+ */
 static int psx_get_title_id_from_pkg(const char *pkg_path, char *out_title_id,
                                      size_t out_title_id_size) {
+#if !defined(PLATFORM_PS4)
+  (void)pkg_path;
+  (void)out_title_id;
+  (void)out_title_id_size;
+  return -1;
+#else
   if (!pkg_path || !out_title_id || out_title_id_size == 0U) {
     return -1;
   }
@@ -146,9 +160,11 @@ static int psx_get_title_id_from_pkg(const char *pkg_path, char *out_title_id,
   (void)f_term();
   dlclose(appinst);
   return rc;
+#endif
 }
 
 int games_psx_install_bgft(const char *pkg_path, const char *content_name,
+                                int slot, int delete_source,
                                 char *out_title_id,
                                 size_t out_title_id_size,
                                 int *out_task_id,
@@ -188,8 +204,10 @@ int games_psx_install_bgft(const char *pkg_path, const char *content_name,
       (content_name && content_name[0] != '\0') ? content_name : "Remote Install";
   params.param.icon_path = "/update/fakepic.png";
   params.param.playgo_scenario_id = "0";
-  params.param.option = BGFT_TASK_OPTION_DELETE_AFTER_UPLOAD;
-  params.slot = 0;
+  /* Packages the user keeps on disk must survive the install; only uploads
+   * staged under /data/zftpd/pkg are removed after the task took them. */
+  params.param.option = delete_source ? BGFT_TASK_OPTION_DELETE_AFTER_UPLOAD : 0;
+  params.slot = (slot == 1) ? 1 : 0;
 
   int task_id = -1;
   int rc = f_register(&params, &task_id);
@@ -264,6 +282,13 @@ int games_psx_uninstall(const char *title_id, int *out_rc) {
 }
 
 #if ENABLE_PKG_INSTALL
+/* Exposed for the API layer: it needs the title id before installing, to ask
+ * the user before replacing an existing installation. */
+int games_psx_pkg_title_id(const char *pkg_path, char *out_title_id,
+                           size_t out_title_id_size) {
+  return psx_get_title_id_from_pkg(pkg_path, out_title_id, out_title_id_size);
+}
+
 int games_psx_install_path(const char *pkg_path, char *out_title_id,
                                 size_t out_title_id_size, int *out_install_rc) {
   if ((pkg_path == NULL) || (out_install_rc == NULL)) {
@@ -316,6 +341,7 @@ int games_psx_install_path(const char *pkg_path, char *out_title_id,
 
 void games_install_state_begin(int task_id, const char *title_id,
                                const char *path) {
+  pthread_mutex_lock(&g_game_install_lock);
   memset(&g_game_install_state, 0, sizeof(g_game_install_state));
   g_game_install_state.active = 1;
   g_game_install_state.task_id = task_id;
@@ -327,14 +353,83 @@ void games_install_state_begin(int task_id, const char *title_id,
     (void)snprintf(g_game_install_state.path,
                    sizeof(g_game_install_state.path), "%s", path);
   }
+  (void)snprintf(g_game_install_state.detail,
+                 sizeof(g_game_install_state.detail), "%s", "Starting installer");
+  pthread_mutex_unlock(&g_game_install_lock);
+}
+
+void games_install_state_progress(int percent, unsigned long transferred,
+                                  unsigned long length) {
+  pthread_mutex_lock(&g_game_install_lock);
+  g_game_install_state.needs_confirm = 0;
+  if (percent >= 0) {
+    g_game_install_state.last_percent = percent;
+  }
+  g_game_install_state.last_transferred = transferred;
+  g_game_install_state.last_length = length;
+  g_game_install_state.active = 1;
+  pthread_mutex_unlock(&g_game_install_lock);
+}
+
+void games_install_state_finish(int error) {
+  games_install_state_finish_detail(error,
+      error == 0 ? "Installation completed" : "Installer failed");
+}
+
+void games_install_state_finish_detail(int error, const char *detail) {
+  pthread_mutex_lock(&g_game_install_lock);
+  g_game_install_state.last_error = error;
+  g_game_install_state.active = 0;
+  if (detail != NULL) {
+    (void)snprintf(g_game_install_state.detail,
+                   sizeof(g_game_install_state.detail), "%s", detail);
+  }
+  pthread_mutex_unlock(&g_game_install_lock);
+}
+
+void games_install_state_message(const char *detail) {
+  if (detail == NULL) return;
+  pthread_mutex_lock(&g_game_install_lock);
+  (void)snprintf(g_game_install_state.detail,
+                 sizeof(g_game_install_state.detail), "%s", detail);
+  pthread_mutex_unlock(&g_game_install_lock);
+}
+
+void games_install_state_mark_helper(void) {
+  pthread_mutex_lock(&g_game_install_lock);
+  g_game_install_state.helper_driven = 1;
+  pthread_mutex_unlock(&g_game_install_lock);
+}
+
+void games_install_state_needs_confirm(int slot, const char *title_id) {
+  pthread_mutex_lock(&g_game_install_lock);
+  g_game_install_state.active = 0;
+  g_game_install_state.needs_confirm = 1;
+  g_game_install_state.slot = slot;
+  if (title_id != NULL) {
+    (void)snprintf(g_game_install_state.title_id,
+                   sizeof(g_game_install_state.title_id), "%s", title_id);
+  }
+  pthread_mutex_unlock(&g_game_install_lock);
 }
 
 void games_install_state_snapshot(games_install_snapshot_t *out) {
-  if (out != NULL) *out = g_game_install_state;
+  if (out == NULL) return;
+  pthread_mutex_lock(&g_game_install_lock);
+  *out = g_game_install_state;
+  pthread_mutex_unlock(&g_game_install_lock);
 }
 
 int games_install_state_refresh(games_install_snapshot_t *out) {
+  pthread_mutex_lock(&g_game_install_lock);
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
+  if (g_game_install_state.helper_driven) {
+    /* Progress arrives from the helper over IPC, not from the download
+     * service, so there is nothing to poll here. */
+    if (out != NULL) *out = g_game_install_state;
+    pthread_mutex_unlock(&g_game_install_lock);
+    return 0;
+  }
   if (g_game_install_state.active && g_game_install_state.task_id >= 0) {
     SceBgftTaskProgress p;
     int rc = 0;
@@ -356,6 +451,7 @@ int games_install_state_refresh(games_install_snapshot_t *out) {
     }
   }
 #endif
-  games_install_state_snapshot(out);
+  if (out != NULL) *out = g_game_install_state;
+  pthread_mutex_unlock(&g_game_install_lock);
   return 0;
 }

@@ -27,6 +27,9 @@ int games_extract_title_id_from_image(const char *, char *, size_t);
 
 typedef struct {
   int active;
+  int helper_driven;
+  int needs_confirm;
+  int slot;
   int task_id;
   int last_percent;
   int last_error;
@@ -34,9 +37,16 @@ typedef struct {
   unsigned long last_transferred;
   char title_id[64];
   char path[FTP_PATH_MAX];
+  char detail[256];
 } games_install_snapshot_t;
 
 void games_install_state_begin(int, const char *, const char *);
+void games_install_state_progress(int, unsigned long, unsigned long);
+void games_install_state_finish(int);
+void games_install_state_finish_detail(int, const char *);
+void games_install_state_message(const char *);
+void games_install_state_mark_helper(void);
+void games_install_state_needs_confirm(int, const char *);
 void games_install_state_snapshot(games_install_snapshot_t *);
 int games_install_state_refresh(games_install_snapshot_t *);
 
@@ -44,8 +54,15 @@ int games_install_state_refresh(games_install_snapshot_t *);
 int games_psx_uninstall(const char *, int *);
 int games_psx_repair_appdb_visibility(const char *, int *, int *);
 #if ENABLE_PKG_INSTALL
-int games_psx_install_bgft(const char *, const char *, char *, size_t, int *, int *);
+/* slot: 0 = internal storage, 1 = extended storage.
+   delete_source: remove the package once the task has taken it. */
+int games_psx_install_bgft(const char *, const char *, int, int, char *, size_t,
+                           int *, int *);
 int games_psx_install_path(const char *, char *, size_t, int *);
+/* Title id carried by a package file, without installing it. */
+int games_psx_pkg_title_id(const char *, char *, size_t);
+/* PS5: installation driven by the embedded helper. */
+int games_ps5_helper_install(const char *, const char *, int, int, char *, size_t, int *, int *);
 #endif
 #endif
 

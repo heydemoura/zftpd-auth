@@ -1,6 +1,7 @@
 #include "games_internal.h"
 #include "../http_api_internal.h"
 #include "ftp_config.h"
+#include "pal_limits.h"
 #include "ftp_log.h"
 #include "pal_notification.h"
 #include <ctype.h>
@@ -18,8 +19,21 @@
 #define SCE_LNC_UTIL_ERROR_ALREADY_INITIALIZED 0x80940018U
 #define SCE_LNC_UTIL_ERROR_INVALID_PARAM 0x80940005U
 #define SCE_LNC_ERROR_APP_NOT_FOUND 0x80940031U
-#define SCE_LNC_APP_ID_BIG_BASE 0x60000000U
-#define SCE_LNC_APP_ID_TYPE_MASK 0xFF000000U
+/**
+ * Returned by the launch call when the title is already being started.
+ *
+ * Observed on PS5 13.60: the application boots anyway, so it must not be
+ * reported as a failure.
+ */
+#define SCE_LNC_UTIL_ERROR_ALREADY_LAUNCHING 0x80A40043U
+/*
+ * Reported by some titles on PS5 13.60 while the launch actually proceeds
+ * (the application reaches the foreground and keeps running), so it must not
+ * be surfaced as a failure.  Observed first with PPSA09259.
+ */
+#define SCE_LNC_UTIL_ERROR_ALREADY_STARTED 0x80940010U
+/* Sony error codes always have bit 31 set. */
+#define SCE_LNC_ERROR_CODE_BIT 0x80000000U
 
 
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
@@ -76,6 +90,22 @@ static int psx_sysmodule_load_internal(unsigned int module_id, int *out_rc) {
 
 #endif
 
+/**
+ * Interpret a launch API return value.
+ *
+ * sceLncUtilLaunchApp()/sceSystemServiceLaunchApp() report success by
+ * returning the application id — 0 on some firmware, 0x60000000-style ids on
+ * PS4 and small ids such as 0x00002018 on PS5 13.60 — and failure with a
+ * 0x8xxxxxxx error code.  Treating "not 0" as a failure reported a successful
+ * launch as "Launch failed: 0x00002018".
+ */
+static int launch_result_is_success(uint32_t res) {
+  return ((res & SCE_LNC_ERROR_CODE_BIT) == 0U) ||
+         (res == SCE_LNC_UTIL_ERROR_ALREADY_RUNNING) ||
+         (res == SCE_LNC_UTIL_ERROR_ALREADY_LAUNCHING) ||
+         (res == SCE_LNC_UTIL_ERROR_ALREADY_STARTED);
+}
+
 static void launch_diag_log(const char *stage, const char *title_id, int code,
                             const char *detail) {
   char line[512];
@@ -86,21 +116,12 @@ static void launch_diag_log(const char *stage, const char *title_id, int code,
                  "[LAUNCH-DIAG] stage=%s title=%s code=0x%08X detail=%s", s,
                  t, (unsigned)code, d);
   fprintf(stderr, "%s\n", line);
-  ftp_log_line((code == 0 ||
-                (uint32_t)code == SCE_LNC_UTIL_ERROR_ALREADY_RUNNING ||
-                (((uint32_t)code & SCE_LNC_APP_ID_TYPE_MASK) ==
-                 SCE_LNC_APP_ID_BIG_BASE))
-                   ? FTP_LOG_INFO
-                   : FTP_LOG_ERROR,
+  ftp_log_line(launch_result_is_success((uint32_t)code) ? FTP_LOG_INFO
+                                                        : FTP_LOG_ERROR,
                line);
 }
 
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
-static int launch_result_is_success(uint32_t res) {
-  return (res == 0U) || (res == SCE_LNC_UTIL_ERROR_ALREADY_RUNNING) ||
-         ((res & SCE_LNC_APP_ID_TYPE_MASK) == SCE_LNC_APP_ID_BIG_BASE);
-}
-
 static int psx_user_id_is_valid(int32_t user_id) {
   return user_id >= 0;
 }
@@ -180,21 +201,12 @@ http_response_t *http_games_launch(const http_request_t *request) {
     return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Missing query string");
   }
 
-  const char *id_param = strstr(query, "id=");
-  if (id_param != NULL) {
-    id_param += 3; /* skip "id=" */
-    size_t id_len = 0U;
-    while ((id_param[id_len] != '\0') && (id_param[id_len] != '&')) {
-      if (id_len >= (sizeof(title_id) - 1U)) {
-        return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
-                          "'id' parameter too long");
-      }
-      title_id[id_len] = id_param[id_len];
-      id_len++;
-    }
-    title_id[id_len] = '\0';
+  if (http_api_query_has_param(query, "id")) {
+    if (http_api_parse_query_param(query, "id", title_id, sizeof(title_id)) != 0)
+      return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
+                                 "Invalid 'id' parameter");
   } else {
-    char path[1024] = "";
+    char path[PAL_PATH_MAX] = "";
     if (http_api_parse_path_param(query, path, sizeof(path)) != 0) {
       return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST,
                         "Missing 'id' or valid 'path' parameter");
@@ -402,7 +414,7 @@ http_response_t *http_games_launch(const http_request_t *request) {
         /*
          * On PS4 the LncUtil entrypoints are commonly exported by
          * libSceSystemService rather than a standalone libSceLncUtil.sprx.
-         * Itemzflow links these stubs directly; dynamic payloads need to
+         * Those entry points live in the system libraries; dynamic payloads need to
          * resolve them from the loaded module.
          */
         if (f_sceLncUtilLaunchApp == NULL) {
@@ -630,7 +642,7 @@ http_response_t *http_games_launch(const http_request_t *request) {
     if (f_sceUserServiceInitialize != NULL) {
       int init_params[8];
       memset(init_params, 0, sizeof(init_params));
-      init_params[0] = 256; /* priority (Itemzflow-like) */
+      init_params[0] = 256; /* priority */
       int uinit_rc = f_sceUserServiceInitialize((void *)init_params);
       launch_diag_log("user_init", title_id, uinit_rc,
                       "sceUserServiceInitialize");
@@ -937,6 +949,26 @@ http_response_t *http_games_launch(const http_request_t *request) {
 #endif
     launch_diag_log("launch_result", title_id, (int)res,
                     "launch API returned");
+
+    /*
+     * Firmware can answer with a code this table does not classify even
+     * though the title is booting.  Ask LNC whether the application is
+     * actually there before reporting a failure: app ids never carry the
+     * error bit, so a plain answer means the launch was accepted.
+     */
+    if ((launch_result_is_success(res) == 0) &&
+        (f_sceLncUtilGetAppId != NULL)) {
+      for (int attempt = 0; attempt < 5; attempt++) {
+        int app_id = f_sceLncUtilGetAppId(title_id);
+        if (((uint32_t)app_id & SCE_LNC_ERROR_CODE_BIT) == 0U) {
+          launch_diag_log("launch_verify", title_id, app_id,
+                          "title is running after launch");
+          res = 0U;
+          break;
+        }
+        if (attempt < 4) usleep(200000U);
+      }
+    }
 
     if (userService != NULL)
       dlclose(userService);

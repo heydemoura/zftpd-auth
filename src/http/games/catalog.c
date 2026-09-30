@@ -56,7 +56,7 @@ int games_append_installed_entries(const char *base,
                                                 sizeof(icon_path)) == 0);
 
     if (!*first) {
-      if (http_api_buf_append_cstr(body, cap, pos, ",") != 0) {
+      if (http_buf_append_cstr(body, cap, pos, ",") != 0) {
         closedir(dir);
         return -1;
       }
@@ -64,17 +64,17 @@ int games_append_installed_entries(const char *base,
     *first = 0;
     (*count_added)++;
 
-    if (http_api_buf_append_cstr(body, cap, pos, "{\"id\":\"") != 0 ||
-        http_api_json_escape_append(body, cap, pos, title_id) != 0 ||
-        http_api_buf_append_cstr(body, cap, pos, "\",\"name\":\"") != 0 ||
-        http_api_json_escape_append(body, cap, pos, title_name) != 0 ||
-        http_api_buf_append_cstr(body, cap, pos, "\",\"path\":\"") != 0 ||
-        http_api_json_escape_append(body, cap, pos, app_dir) != 0 ||
-        http_api_buf_append_cstr(body, cap, pos, "\",\"source\":\"") != 0 ||
-        http_api_json_escape_append(body, cap, pos, base) != 0 ||
-        http_api_buf_append_cstr(body, cap, pos, "\",\"has_icon\":") != 0 ||
-        http_api_buf_append_cstr(body, cap, pos, has_icon ? "true" : "false") != 0 ||
-        http_api_buf_append_cstr(body, cap, pos, "}") != 0) {
+    if (http_buf_append_cstr(body, cap, pos, "{\"id\":\"") != 0 ||
+        http_json_escape_append(body, cap, pos, title_id) != 0 ||
+        http_buf_append_cstr(body, cap, pos, "\",\"name\":\"") != 0 ||
+        http_json_escape_append(body, cap, pos, title_name) != 0 ||
+        http_buf_append_cstr(body, cap, pos, "\",\"path\":\"") != 0 ||
+        http_json_escape_append(body, cap, pos, app_dir) != 0 ||
+        http_buf_append_cstr(body, cap, pos, "\",\"source\":\"") != 0 ||
+        http_json_escape_append(body, cap, pos, base) != 0 ||
+        http_buf_append_cstr(body, cap, pos, "\",\"has_icon\":") != 0 ||
+        http_buf_append_cstr(body, cap, pos, has_icon ? "true" : "false") != 0 ||
+        http_buf_append_cstr(body, cap, pos, "}") != 0) {
       closedir(dir);
       return -1;
     }
