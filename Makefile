@@ -305,13 +305,16 @@ ifeq ($(ENABLE_ZHTTPD),1)
     ENABLE_PKG_INSTALL ?= 1
     CFLAGS += -DENABLE_PKG_INSTALL=$(ENABLE_PKG_INSTALL)
     ifeq ($(TARGET),ps5)
+      ifeq ($(ENABLE_PKG_INSTALL),1)
         # The system installer cannot be driven from a payload process, so a
-        # small helper program is embedded here and delivered at runtime.
+        # small helper program is embedded here and delivered at runtime.  With
+        # the installer disabled the helper is neither built nor embedded.
         INSTALL_HELPER_ELF := $(BUILD_DIR)/install_helper.elf
         INSTALL_HELPER_BLOB := $(BUILD_DIR)/generated/install_helper_blob.c
         SOURCES += $(INSTALL_HELPER_BLOB)
-        SOURCES += src/http/games/ps5_install_helper.c
         CFLAGS += -DZFTPD_INSTALL_HELPER=1
+      endif
+      SOURCES += src/http/games/ps5_install_helper.c
     endif
     ENABLE_LIBCURL ?= 1
     SOURCES += $(EVENT_LOOP_SRC)
