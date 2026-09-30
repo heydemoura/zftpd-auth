@@ -21,6 +21,13 @@ are not yet implemented.
   `ENABLE_PKG_INSTALL` must default to on whenever `ENABLE_ZHTTPD=1`, and stay
   overridable with `ENABLE_PKG_INSTALL=0`. Verify a release build still links
   before committing this default.
+- **Off in the published releases**: the release workflow builds every artifact
+  with `ENABLE_PKG_INSTALL=0`. A build without the installer stubs its
+  endpoints (HTTP 409 `PKG installation is disabled for this build`) and the
+  web UI hides every entry point behind the flag the daemon reports in
+  `/api/status` (`features.pkg_install`): the *Install PKG* action in Games,
+  the *Install package* item in the file explorer, and the install progress
+  pollers.
 - The package is **never read into memory**: it is served over HTTP on loopback
   and the system installer pulls it from that URL.
 

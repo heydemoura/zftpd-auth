@@ -2,6 +2,24 @@
 
 ## Endpoints
 
+### GET /api/status
+
+Identity and build switches of the running daemon. The web interface polls it
+for the connection state and to know which features the payload was compiled
+with, so views can hide what the build does not have.
+
+```json
+{"ok":true,"version":"1.6.0","instance_id":"15114b8a2c31d9f0",
+ "start_monotonic_ns":463980095296000,"pid":74,"platform":"ps4",
+ "features":{"pkg_install":false}}
+```
+
+- `instance_id` changes when the payload is re-injected: clients treat it as a
+  restart and drop their server-side handles.
+- `features.pkg_install` mirrors the `ENABLE_PKG_INSTALL` build flag. When it is
+  `false` the package installer endpoints answer `409 PKG installation is
+  disabled for this build` and the UI hides the installer entirely.
+
 ### GET /api/list
 
 List directory contents.

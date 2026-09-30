@@ -59,6 +59,11 @@
       conn.instanceId = status.instance_id;
     }
     api.info = status || api.info;
+    /* Compile-time switches travel with the status so the views can hide what
+     * the daemon was built without (e.g. the package installer). */
+    if (status && status.features) {
+      ZF.features.pkgInstall = status.features.pkg_install === true;
+    }
     return restarted;
   }
 

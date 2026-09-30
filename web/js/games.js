@@ -117,6 +117,12 @@
 
   function pollInstall() {
     clearTimeout(installTimer);
+    /* Builds without the installer answer 409: keep quiet and re-check later,
+     * so a reconnect to a build that has it keeps working. */
+    if (!ZF.features.pkgInstall) {
+      installTimer = setTimeout(pollInstall, 10000);
+      return;
+    }
     api.installStatus().then(function (st) {
       renderInstall(st);
       installTimer = setTimeout(pollInstall, st && st.active ? 2000 : 8000);
@@ -334,7 +340,7 @@
 
   /** Adds the header action once the view markup is on the page. */
   function wireInstallButton() {
-    if (dom.installWired) return;
+    if (dom.installWired || !ZF.features.pkgInstall) return;
     var actions = document.querySelector('#view-games .page-actions-wide');
     if (!actions) return;
     var btn = ZF.button({ label: 'Install PKG', size: 'sm', icon: 'package', onclick: installPkg });

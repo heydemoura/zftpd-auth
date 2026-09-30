@@ -84,6 +84,12 @@
 
   function pollInstall() {
     clearTimeout(installTimer);
+    /* Hidden behind the build flag, like the rest of the installer: skip the
+     * request (the daemon answers 409 for it) and re-check later. */
+    if (!ZF.features.pkgInstall) {
+      installTimer = setTimeout(pollInstall, 15000);
+      return;
+    }
     api.installStatus().then(function (st) {
       renderInstall(st);
       installTimer = setTimeout(pollInstall, st && st.active ? 2000 : 10000);

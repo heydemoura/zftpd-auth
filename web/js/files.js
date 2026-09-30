@@ -845,7 +845,7 @@
         items.push('-');
         items = items.concat(extractItems(one));
       }
-      if (write && one && !one.isDir && /\.(pkg|fpkg|ffpkg)$/i.test(one.name)) {
+      if (write && one && !one.isDir && ZF.features.pkgInstall && /\.(pkg|fpkg|ffpkg)$/i.test(one.name)) {
         items.push('-');
         items.push({ label: 'Install package', icon: 'package', onclick: function () { installPackage(one); } });
       }

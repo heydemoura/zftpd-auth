@@ -34,6 +34,12 @@
 #ifndef _WIN32
 #include <sys/ioctl.h>
 #endif
+
+/* Reported to the web UI so it can hide the package installer when the build
+ * disables it. */
+#ifndef ENABLE_PKG_INSTALL
+#define ENABLE_PKG_INSTALL 0
+#endif
 #if defined(PLATFORM_LINUX) && __has_include(<sys/sysinfo.h>)
 #define HAS_SYSINFO 1
 #include <sys/sysinfo.h>
@@ -651,8 +657,8 @@ static http_response_t *api_status(const http_request_t *request) {
   uint64_t instance_id = ftp_daemon_instance_id();
   uint64_t start_ns = ftp_daemon_start_monotonic_ns();
 
-  char body[320];
-  size_t pos = 0;
+  char body[384];
+  size_t pos = 0U;
   size_t cap = sizeof(body);
 #if defined(PLATFORM_PS5)
   const char *platform = "ps5";
@@ -665,9 +671,10 @@ static http_response_t *api_status(const http_request_t *request) {
   pos += (size_t)snprintf(
       body + pos, cap - pos,
       "{\"ok\":true,\"version\":\"%s\",\"instance_id\":\"%016llx\","
-      "\"start_monotonic_ns\":%" PRIu64 ",\"pid\":%d,\"platform\":\"%s\"}",
+      "\"start_monotonic_ns\":%" PRIu64 ",\"pid\":%d,\"platform\":\"%s\","
+      "\"features\":{\"pkg_install\":%s}}",
       RELEASE_VERSION, (unsigned long long)instance_id, start_ns,
-      (int)getpid(), platform);
+      (int)getpid(), platform, ENABLE_PKG_INSTALL ? "true" : "false");
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
   http_response_add_header(resp, "Content-Type", "application/json");
