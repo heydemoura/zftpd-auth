@@ -211,6 +211,9 @@
 
   api.status = function () { return get('/api/status'); };
   api.stats = function (path) { return get('/api/stats' + qs({ path: path || '/' })); };
+  /* Removable volumes actually mounted (the console creates the /mnt/usbN
+   * directories even with nothing plugged in). */
+  api.mounts = function () { return get('/api/mounts'); };
   api.ram = function () { return get('/api/stats/ram'); };
   api.system = function () { return get('/api/stats/system'); };
   api.diskInfo = function () { return get('/api/disk/info'); };
@@ -218,13 +221,43 @@
   api.killProcess = function (pid) { return post('/api/process/kill', { pid: pid }); };
   api.fan = function (threshold) { return get('/api/admin/fan?threshold=' + parseInt(threshold, 10)); };
   api.networkReset = function () { return post('/api/network/reset').then(soft); };
+  api.discState = function () { return get('/api/system/disc'); };
+  api.discEject = function () { return post('/api/system/eject').then(soft); };
   api.notify = function (text) { return post('/api/notify' + qs({ text: text })); };
 
   /* ── Files ──────────────────────────────────────────────────────────── */
 
   api.list = function (path) { return get('/api/list' + qs({ path: path })); };
   api.dirSize = function (path) { return get('/api/dirsize' + qs({ path: path })); };
-  api.fileUrl = function (path) { return '/api/file/get' + qs({ path: path }); };
+  api.fileUrl = function (path) {
+    /* decryptSelf asks the daemon for the decrypted SELF payload; without it
+     * the raw on-disk container is sent, like every other transfer. */
+    return '/api/file/get' + qs({ path: path, decrypt: ZF.settings.decryptSelf ? 1 : undefined });
+  };
+  /* Bulk download: the selection is posted once and the daemon answers with a
+   * short id, because a long path list does not fit in a request URL. */
+  /* Decrypted game dump: start it, then either download the prepared archive
+   * or let the daemon write it on the console. */
+  api.dumpStart = function (titleId, options) {
+    var body = { title_id: titleId, target: (options && options.target) || 'download' };
+    if (options && options.format) body.format = options.format;
+    if (options && options.dest) body.dest = options.dest;
+    if (options && options.decrypt !== undefined) body.decrypt = options.decrypt ? 1 : 0;
+    return post('/api/dump/start', body);
+  };
+
+  api.dumpStatus = function () { return get('/api/dump/status'); };
+  api.dumpCancel = function (id) { return post('/api/dump/cancel', { id: id }); };
+  api.dumpDownloadUrl = function (id) { return '/api/dump?id=' + encodeURIComponent(id); };
+
+  api.prepareZip = function (paths, name) {
+    return post('/api/archive/zip', { paths: paths, name: name });
+  };
+
+  api.zipDownloadUrl = function (id) {
+    return '/api/archive/zip?id=' + encodeURIComponent(id);
+  };
+
   api.mkdir = function (dir, name) { return post('/api/mkdir' + qs({ path: dir, name: name })); };
   api.createFile = function (dir, name) { return post('/api/create_file' + qs({ path: dir, name: name })); };
   api.remove = function (path, recursive) {
@@ -280,6 +313,10 @@
   api.downloadStatus = function () { return get('/api/download/status'); };
   api.downloadPause = function (id) { return post('/api/download/pause', { id: id }); };
   api.downloadCancel = function (id) { return post('/api/download/cancel', { id: id }); };
+  api.downloadRetry = function (id) { return post('/api/download/retry', { id: id }); };
+  api.downloadDelete = function (id) { return post('/api/download/delete', { id: id }); };
+  api.downloadOrphans = function () { return get('/api/download/orphans'); };
+  api.downloadOrphanDelete = function (path) { return post('/api/download/orphan/delete', { path: path }); };
 
   /* ── Games ──────────────────────────────────────────────────────────── */
 
@@ -297,6 +334,19 @@
     return post('/api/admin/games/' + (reinstall ? 'reinstall' : 'install') + qs({ path: path })).then(soft);
   };
   api.installStatus = function () { return get('/api/admin/games/install_status'); };
+  /* PKG installation. The daemon refuses to replace an installation on its own:
+   * overwrite is passed only after the user confirms. */
+  api.pkgInstall = function (source, dest, overwrite) {
+    /* A link is downloaded by the console itself as part of the install; a
+     * path is a package that is already on console storage. */
+    var remote = /^https?:\/\//i.test(source || '');
+    var q = { dest: dest, overwrite: overwrite ? 1 : undefined };
+    if (remote) q.url = source; else q.path = source;
+    return post('/api/admin/games/install' + qs(q)).then(soft);
+  };
+  /* Packages staged by the web interface live here; they are removed by the
+   * daemon once the installer has taken them. */
+  api.pkgStagingDir = '/data/zftpd/pkg';
   api.packageMeta = function (path) { return get('/api/game/meta' + qs({ path: path })); };
   api.packageIconUrl = function (path) { return '/api/game/icon' + qs({ path: path }); };
 

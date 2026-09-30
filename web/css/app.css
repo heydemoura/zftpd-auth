@@ -715,6 +715,7 @@ body { display: flex; flex-direction: column; }
 .xfer-name { font-weight: 500; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .xfer-top .status { margin-left: 12px; flex: none; }
 .xfer-sub { font-size: 12.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.xfer-destination { color: var(--text-3); }
 .xfer .progress { margin-top: 8px; }
 .xfer-meta { display: flex; font-size: 12.5px; color: var(--text-2); margin-top: 6px; font-variant-numeric: tabular-nums; }
 .xfer-meta > * + * { margin-left: 16px; }
@@ -815,6 +816,35 @@ body { display: flex; flex-direction: column; }
 .dialog-foot { display: flex; justify-content: flex-end; align-items: center; padding: 16px 20px 18px; }
 .dialog-foot .btn + .btn { margin-left: 8px; }
 .dialog-foot .foot-left { margin-right: auto; }
+
+.pkg-dialog { display: grid; gap: 12px; }
+.pkg-dialog > p { margin: 0; line-height: 1.45; }
+.pkg-field-label { font-size: 13px; font-weight: 600; color: var(--text); margin-top: 4px; }
+.pkg-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.pkg-source, .pkg-destination {
+  min-height: 38px; padding: 7px 12px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--surface); color: var(--text);
+  font: inherit; cursor: pointer;
+}
+.pkg-source.is-active, .pkg-destination.is-active {
+  border-color: var(--accent); background: var(--accent-soft); color: var(--accent-text);
+}
+.pkg-destination:disabled { opacity: .5; cursor: not-allowed; }
+.pkg-source-pane { min-width: 0; }
+.pkg-source-pane[hidden] { display: none; }
+.pkg-source-pane .input { width: 100%; box-sizing: border-box; }
+.pkg-dropzone {
+  width: 100%; min-height: 112px; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 5px; padding: 16px;
+  border: 1px dashed var(--accent); border-radius: var(--radius-lg);
+  background: var(--surface-2); color: var(--text); font: inherit; cursor: pointer;
+}
+.pkg-dropzone.is-over { background: var(--accent-soft); }
+.pkg-dropzone .ic { width: 24px; height: 24px; color: var(--accent-text); }
+.pkg-dropzone small { color: var(--text-2); }
+.pkg-selected { min-width: 0; overflow-wrap: anywhere; font-size: 12.5px; }
+.pkg-progress { min-height: 18px; font-size: 12.5px; }
+.pkg-progress-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 
 .name-list {
   margin: 10px 0 0; padding: 8px 12px; list-style: none; max-height: 160px; overflow: auto;

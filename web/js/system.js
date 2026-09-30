@@ -15,6 +15,8 @@
     fanValue: $('fan-value'),
     fanApply: $('fan-apply'),
     netReset: $('net-reset'),
+    discRow: $('disc-setting'),
+    discEject: $('disc-eject'),
     notifyForm: $('notify-form'),
     notifyText: $('notify-text'),
     procSection: $('sys-proc-section'),
@@ -178,6 +180,28 @@
       }, function (e) { ZF.toastError(e, 'Restart failed'); });
     });
   });
+
+  /* ── Blu-ray drive ──────────────────────────────────────────────────── */
+
+  if (dom.discEject) {
+    dom.discEject.addEventListener('click', function () {
+      ZF.confirm({
+        title: 'Eject the disc?',
+        message: 'The Blu-ray tray opens. Make sure no disc game is running.',
+        confirmLabel: 'Eject'
+      }).then(function (ok) {
+        if (!ok) return;
+        api.discEject().then(function (res) {
+          ZF.toast((res && res.message) || 'Disc ejected', { type: 'success' });
+        }, function (e) { ZF.toastError(e, 'Eject failed'); });
+      });
+    });
+
+    /* Digital Edition consoles expose no drive node: keep the action hidden. */
+    api.discState().then(function (res) {
+      if (dom.discRow) dom.discRow.hidden = !(res && res.present);
+    }, function () {});
+  }
 
   dom.notifyForm.addEventListener('submit', function (e) {
     e.preventDefault();

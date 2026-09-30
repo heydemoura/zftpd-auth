@@ -272,6 +272,7 @@ window.ZF = ZF;
     showProtected: false,
     startPath: '/',
     downloadDest: '/',
+    decryptSelf: false,
     bookmarks: [],
     fanThreshold: 60,
     sortKey: 'name',

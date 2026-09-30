@@ -1,0 +1,113 @@
+name: Console crash or payload failure
+description: Report a PS4/PS5 hard crash, kernel panic, or unsafe payload behaviour.
+title: "[Crash]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for console hangs, kernel panics, payload exits, or any operation that leaves the console unstable. Crashes caused by the kernel-side features (net filter, protected file decryption, disc eject) are especially valuable: include the debug endpoints output.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - PS5
+        - PS4
+    validations:
+      required: true
+
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware / environment
+      placeholder: "Console firmware, jailbreak and payload loader"
+    validations:
+      required: true
+
+  - type: input
+    id: build
+    attributes:
+      label: zftpd build
+      description: Release tag, commit SHA, branch, and whether it is a release or a local build.
+      placeholder: "v1.6.0, main@abcdef0, local release build"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operation
+    attributes:
+      label: Operation that triggered the crash
+      options:
+        - Payload startup
+        - FTP connection / login
+        - FTP transfer (upload or download)
+        - HTTP download (single file)
+        - Download queue / resume
+        - Bulk download (ZIP)
+        - Game dump - to this PC
+        - Game dump - to console storage
+        - Game launch
+        - Disc eject
+        - Mounts / external storage
+        - DNS filter toggle
+        - Net filter installation (PS5)
+        - Settings change
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: target
+    attributes:
+      label: Target and paths
+      description: Include the title ID, the paths involved, the destination (PC or console), the transfer size and the protocol used.
+      placeholder: |
+        Title ID / content:
+        Source path:
+        Destination:
+        Transfer size:
+        Protocol (FTP / HTTP / web UI):
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Exact reproduction path
+      description: Start from payload injection and include every action taken in the web interface or FTP client.
+      placeholder: |
+        1. Inject the payload with ...
+        2. Open the web interface ...
+        3. Start ...
+        4. Console crashes / payload exits after ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: crash_behavior
+    attributes:
+      label: Crash behaviour
+      description: Describe the visible console state, the payload output, and whether the console reboots.
+      placeholder: |
+        Console state:
+        Payload log:
+        Reboot required:
+        Frequency (always / sometimes / once):
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste the payload console output, plus `GET /api/status`, `GET /api/debug/kernel` and `GET /api/dump/status` when the crash involved decryption or dumping.
+      render: text
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I can reproduce this on my own console and I am willing to retest with a diagnostic build.
+          required: true
+        - label: I did not use zftpd against online services, multiplayer sessions, or content I do not own.
+          required: true

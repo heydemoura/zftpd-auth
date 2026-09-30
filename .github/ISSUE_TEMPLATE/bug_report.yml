@@ -1,0 +1,116 @@
+name: Bug report
+description: Report a reproducible zftpd problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. zftpd is a homebrew FTP + web explorer payload for jailbroken PS4/PS5 consoles: keep reports focused on the payload, the FTP/HTTP servers and the web interface itself.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which area is affected?
+      options:
+        - Payload - PS5
+        - Payload - PS4
+        - FTP server
+        - Web UI - Files
+        - Web UI - Games
+        - Web UI - Transfers
+        - Web UI - Settings
+        - HTTP API
+        - Download queue / resume
+        - ZIP archive / bulk download
+        - Game dumping (decrypted or raw)
+        - Protected file decryption (.self)
+        - DNS filter
+        - Net filter (kernel, PS5)
+        - Launch / disc handling
+        - Mounts / external storage
+        - Build / release
+        - Documentation
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: zftpd version or commit
+      description: Release tag, commit SHA, or branch name — do not report against an unknown build.
+      placeholder: "v1.6.0, main@abcdef0, or local branch name"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: The exact setup matters more than anything else in this project.
+      placeholder: |
+        Console model:
+        Firmware:
+        Jailbreak / payload loader (e.g. elfldr on port 9021, GoldHEN):
+        Payload SDK used to build (e.g. PacBrew v0.40.2):
+        Payload build (release/debug, ENABLE_ZHTTPD):
+        Client OS and browser:
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: List the shortest reliable path that triggers the issue.
+      placeholder: |
+        1. Load the payload with ...
+        2. Open http://<console-ip>:8888 ...
+        3. Start a transfer / dump / launch ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should zftpd have done instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened? Include exact errors, HTTP status codes, screenshots, or console output if available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: Paste the payload console output, `GET /api/status`, one of the `/api/debug/*` endpoints, or the browser console log when relevant.
+      render: text
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Checks already tried
+      description: Mark or describe anything you already ran.
+      value: |
+        - [ ] `make test`
+        - [ ] Release build for the affected target (PS4 / PS5)
+        - [ ] Reloaded the web interface (hard reload, no cache)
+        - [ ] Reproduced on a clean checkout
+        - [ ] Reproduced after reinjecting the payload
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Use scope
+      description: zftpd is a file management and transfer tool for consoles you own.
+      options:
+        - label: This report is about zftpd itself, not a request for piracy, online cheating or help with content I do not own.
+          required: true

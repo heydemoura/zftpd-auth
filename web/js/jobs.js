@@ -27,7 +27,8 @@
     upload: { icon: 'upload', verb: 'Uploading', lane: 'upload' },
     copy: { icon: 'copy', verb: 'Copying', lane: 'copy' },
     move: { icon: 'move', verb: 'Moving', lane: 'copy' },
-    extract: { icon: 'archive', verb: 'Extracting', lane: 'extract' }
+    extract: { icon: 'archive', verb: 'Extracting', lane: 'extract' },
+    dump: { icon: 'download', verb: 'Dumping', lane: 'dump' }
   };
 
   var STATE_LABEL = {
@@ -62,6 +63,7 @@
     this.error = '';
     this.summary = '';
     this.canPause = !!spec.canPause;
+    this.canCancel = spec.canCancel !== false;
     this.cancelRequested = false;
     this.interrupted = false;
     this.created = Date.now();
@@ -176,13 +178,50 @@
 
   function dismiss(job) {
     if (!job.isFinished()) return;
+    if (job.kind === 'dump') dismissedDumpId = job.serverDumpId;
     var i = jobs.indexOf(job);
     if (i >= 0) jobs.splice(i, 1);
     changed();
   }
 
   function clearFinished() {
-    for (var i = jobs.length - 1; i >= 0; i--) if (jobs[i].isFinished()) jobs.splice(i, 1);
+    for (var i = jobs.length - 1; i >= 0; i--) if (jobs[i].isFinished()) {
+      if (jobs[i].kind === 'dump') dismissedDumpId = jobs[i].serverDumpId;
+      jobs.splice(i, 1);
+    }
+    changed();
+  }
+
+  var dismissedDumpId = 0;
+  function observeDump(st) {
+    if (!st || !st.active || st.id === dismissedDumpId) return;
+    var job = null;
+    for (var i = 0; i < jobs.length; i++) {
+      if (jobs[i].kind === 'dump' && jobs[i].serverDumpId === st.id) { job = jobs[i]; break; }
+    }
+    if (!job) {
+      job = new Job({ kind: 'dump', title: 'Dump ' + (st.title_id || ''), canCancel: true });
+      job.serverDumpId = st.id;
+      job.state = 'active';
+      jobs.push(job);
+      showTray();
+    }
+    job.onCancel = function () {
+      /* Errors are ignored: the next poll reports the real state. */
+      api.dumpCancel(job.serverDumpId).then(null, function () { /* ignore */ });
+    };
+    job.title = 'Dump ' + (st.title_id || '');
+    job.detail = st.state === 'launching' ? 'Launching game' :
+      st.state === 'ready' ? 'Ready to download' :
+      st.to_console ? 'Saving on console' : 'Sending to this PC';
+    job.indeterminate = !st.size && st.state !== 'done';
+    if (st.state === 'running' || st.state === 'done')
+      job.progress(st.state === 'done' ? st.size : (st.bytes_done || 0), st.size || 0);
+    if (st.state === 'done') { job.state = 'done'; job.summary = 'Dump complete'; }
+    else if (st.state === 'failed') {
+      if (st.cancelled) { job.state = 'cancelled'; job.error = ''; }
+      else { job.state = 'error'; job.error = st.message || 'Dump failed'; }
+    } else job.state = 'active';
     changed();
   }
 
@@ -654,7 +693,7 @@
       if (job.canPause && job.state === 'active') {
         btn(st === 'paused' ? 'play' : 'pause', st === 'paused' ? 'Resume' : 'Pause', function () { togglePause(job); });
       }
-      btn('x', 'Cancel', function () { cancel(job); });
+      if (job.canCancel) btn('x', 'Cancel', function () { cancel(job); });
     } else {
       if (job.dest && job.state !== 'cancelled') {
         btn('folder', 'Show in Files', function () { ZF.emit('open-path', job.dest); });
@@ -777,6 +816,7 @@
     transfer: transfer,
     transferBlocker: transferBlocker,
     extract: extract,
+    observeDump: observeDump,
     cancel: cancel,
     clearFinished: clearFinished,
     JobList: JobList

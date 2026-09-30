@@ -219,12 +219,12 @@
         </div>
         <div class="page-body">
           <section class="section">
-            <div class="section-head"><h2 class="section-title">Download from URL</h2></div>
+            <div class="section-head"><h2 class="section-title">Download from link</h2></div>
             <form class="card card-pad dl-form" id="dl-form" autocomplete="off">
               <div class="field">
-                <label class="field-label" for="dl-url">URL</label>
-                <input class="input" id="dl-url" type="url" placeholder="https://example.com/file.pkg" spellcheck="false">
-                <div class="field-hint" id="dl-url-hint">HTTP, HTTPS, FTP and FTPS links are supported. The download runs on the server and continues if you close this page.</div>
+                <label class="field-label" for="dl-url">URL or magnet link</label>
+                <input class="input" id="dl-url" type="text" inputmode="url" placeholder="https://example.com/file.pkg or magnet:?xt=..." spellcheck="false">
+                <div class="field-hint" id="dl-url-hint">HTTP, HTTPS, FTP, FTPS and magnet links are supported when BitTorrent is enabled. The download runs on the console and continues if you close this page.</div>
               </div>
               <div class="dl-form-row">
                 <div class="field field-grow">
@@ -242,6 +242,24 @@
               <span class="section-meta" id="dl-count"></span>
             </div>
             <div class="card" id="dl-list"></div>
+          </section>
+
+          <section class="section" id="dump-section" hidden>
+            <div class="section-head"><h2 class="section-title">Game dump</h2></div>
+            <div class="card" id="dump-list"></div>
+          </section>
+
+          <section class="section" id="pkg-section" hidden>
+            <div class="section-head"><h2 class="section-title">Package installation</h2></div>
+            <div class="card" id="pkg-list"></div>
+          </section>
+
+          <section class="section" id="orphan-section" hidden>
+            <div class="section-head">
+              <h2 class="section-title">Unlinked partial downloads</h2>
+              <span class="section-meta" id="orphan-count"></span>
+            </div>
+            <div class="card" id="orphan-list"></div>
           </section>
 
           <section class="section">
@@ -313,6 +331,15 @@
                 </div>
                 <div class="setting-control">
                   <button class="btn btn-sm" id="net-reset" type="button"><svg class="ic" aria-hidden="true"><use xlink:href="#i-power"></use></svg><span>Restart</span></button>
+                </div>
+              </div>
+              <div class="setting" id="disc-setting" hidden>
+                <div class="setting-text">
+                  <div class="setting-title">Eject disc</div>
+                  <div class="setting-desc">Opens the Blu-ray tray. Make sure no disc game is running.</div>
+                </div>
+                <div class="setting-control">
+                  <button class="btn btn-sm" id="disc-eject" type="button"><svg class="ic" aria-hidden="true"><use xlink:href="#i-disc"></use></svg><span>Eject</span></button>
                 </div>
               </div>
               <div class="setting">

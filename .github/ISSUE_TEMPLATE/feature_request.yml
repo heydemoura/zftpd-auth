@@ -1,0 +1,74 @@
+name: Feature request
+description: Propose a zftpd capability or workflow improvement.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests should describe a workflow you actually run: transferring files, managing a console's storage, dumping a title you own, or automating the payload through its HTTP API.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - FTP server
+        - HTTP API
+        - Web UI - Files
+        - Web UI - Games
+        - Web UI - Transfers
+        - Web UI - Settings
+        - Download queue / resume
+        - ZIP archive / bulk download
+        - Game dumping
+        - Protected file decryption (.self)
+        - DNS filter
+        - Net filter (kernel, PS5)
+        - Launch / disc handling
+        - Mounts / external storage
+        - Build / release
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow or problem
+      description: What are you trying to do, and where does zftpd slow you down today?
+      placeholder: "I want to ... because ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the user-facing behaviour, the endpoint or FTP command, and how it should appear in the interface.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Mention existing workarounds, other payloads or tools, and why they are not enough.
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: How should it be verified?
+      description: List the expected host tests, manual console checks and documentation updates.
+      placeholder: |
+        - Host test:
+        - PS4/PS5 manual check:
+        - HTTP API or FTP level check:
+        - Documentation:
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Use scope
+      options:
+        - label: This request is about managing files on a console I own, not about piracy, online cheating or bypassing services.
+          required: true

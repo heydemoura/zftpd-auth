@@ -98,6 +98,13 @@
   /* ── Loading ────────────────────────────────────────────────────────── */
 
   var loadingTimer = null;
+  var pendingReveal = null;
+
+  function reveal(path) {
+    path = P.norm(path);
+    pendingReveal = { dir: P.parent(path) || '/', name: P.base(path) };
+    ZF.go(hashFor(pendingReveal.dir));
+  }
 
   function load(path, opts) {
     opts = opts || {};
@@ -489,6 +496,11 @@
       title: allFiles ? 'Download' : 'Folders cannot be downloaded from the browser. Use FTP instead.',
       onclick: function () { download(sel); }
     }));
+    bar.appendChild(cmd({
+      icon: 'archive', label: 'ZIP', collapse: true,
+      title: 'Download the selection as a ZIP archive (folders included)',
+      onclick: function () { downloadZip(sel); }
+    }));
     if (write) {
       if (one) bar.appendChild(cmd({ icon: 'pencil', label: 'Rename', collapse: true, title: 'Rename (F2)', onclick: function () { rename(one); } }));
       bar.appendChild(cmd({ icon: 'copy', label: 'Copy to\u2026', collapse: true, onclick: function () { transferTo('copy', sel); } }));
@@ -567,6 +579,25 @@
   function openEntry(e) {
     if (e.isDir) go(entryPath(e));
     else details(e);
+  }
+
+  /* One archive streamed by the daemon: works for folders too, and for
+   * selections far larger than the browser's multiple-download limit. */
+  function downloadZip(entries) {
+    if (!entries.length) return;
+    var paths = [];
+    for (var i = 0; i < entries.length; i++) paths.push(entryPath(entries[i]));
+    var name = (entries.length === 1 ? entries[0].name : 'zftpd-selection') + '.zip';
+
+    ZF.toast('Preparing ' + ZF.plural(entries.length, 'item') + ' for ' + name, { type: 'success' });
+    api.prepareZip(paths, name).then(function (res) {
+      if (!res || res.ok === false || !res.id) {
+        throw new Error((res && res.message) || 'Could not prepare the archive');
+      }
+      ZF.triggerDownload(api.zipDownloadUrl(res.id), name);
+    }, function (e) {
+      ZF.toastError(e, 'ZIP failed');
+    });
   }
 
   function download(entries) {
@@ -748,6 +779,56 @@
     ZF.toast(i >= 0 ? 'Removed from Places' : 'Added to Places', { type: 'success', timeout: 2000 });
   }
 
+  /**
+   * Install a package from the console copy at @p one.
+   *
+   * The destination is asked first; the replacement question is asked only when
+   * the daemon reports that the very same title is already installed, so the
+   * common path stays one dialog long.
+   */
+  function installPackage(one) {
+    var path = entryPath(one);
+
+    function run(dest, overwrite) {
+      api.pkgInstall(path, dest, overwrite).then(function () {
+        ZF.toast('Installing ' + one.name +
+          (dest === 'extended' ? ' to extended storage' : ' to internal storage') + '\u2026',
+          { type: 'success' });
+      }).catch(function (err) {
+        var data = err && err.data;
+        if (data && data.error === 'already_installed') {
+          ZF.confirm({
+            title: 'Already installed',
+            message: (data.title_id || one.name) +
+              ' is already installed on this console. Replace it with this package?',
+            confirmLabel: 'Replace',
+            danger: true
+          }).then(function (ok) { if (ok) run(dest, true); });
+          return;
+        }
+        ZF.toastError(err, 'Could not install ' + one.name);
+      });
+    }
+
+    ZF.dialog({
+      title: 'Install package',
+      content: el('div', null, [
+        el('p', { text: one.name + ' will be installed from ' + path + '.' }),
+        el('p', { class: 'subtle', text: 'Choose where it should be installed.' })
+      ]),
+      actions: [
+        { id: 'cancel', label: 'Cancel' },
+        { id: 'internal', label: 'Internal storage', kind: 'primary', submit: true },
+        { id: 'extended', label: 'Extended storage', submit: true }
+      ],
+      onAction: function (id) {
+        if (id === 'internal') { run('internal', false); return true; }
+        if (id === 'extended') { run('extended', false); return true; }
+        return true;
+      }
+    });
+  }
+
   /** Context / overflow menu for the selection. */
   function itemMenu(sel, overflow) {
     var write = canWrite();
@@ -759,9 +840,14 @@
     if (!overflow) {
       if (one) items.push({ label: one.isDir ? 'Open' : 'Open details', icon: one.isDir ? 'folder' : 'eye', hint: 'Enter', onclick: function () { openEntry(one); } });
       if (allFiles) items.push({ label: 'Download', icon: 'download', onclick: function () { download(sel); } });
+      items.push({ label: 'Download as ZIP', icon: 'archive', onclick: function () { downloadZip(sel); } });
       if (write && one && !one.isDir && ZF.isArchive(one.name)) {
         items.push('-');
         items = items.concat(extractItems(one));
+      }
+      if (write && one && !one.isDir && /\.(pkg|fpkg|ffpkg)$/i.test(one.name)) {
+        items.push('-');
+        items.push({ label: 'Install package', icon: 'package', onclick: function () { installPackage(one); } });
       }
       items.push('-');
       if (write) {
@@ -1369,21 +1455,26 @@
   function discoverPlaces() {
     Promise.all([
       api.list('/').then(function (r) { return r.entries || []; }, function () { return []; }),
-      api.list('/mnt').then(function (r) { return r.entries || []; }, function () { return []; })
+      /* The daemon reports the volumes that are actually mounted: the console
+       * creates /mnt/usbN even with nothing plugged in, so listing the
+       * directory showed every slot as a drive. */
+      api.mounts().then(function (r) { return (r && r.mounts) || []; }, function () { return []; })
     ]).then(function (res) {
-      var root = {}, mnt = [];
+      var root = {};
       for (var i = 0; i < res[0].length; i++) if (res[0][i].type === 'directory') root[res[0][i].name] = true;
-      for (var j = 0; j < res[1].length; j++) if (res[1][j].type === 'directory') mnt.push(res[1][j].name);
       var out = [{ path: '/', label: 'Root', icon: 'drive' }];
       if (root.data) out.push({ path: '/data', label: 'data', icon: 'folder' });
       if (root.user) out.push({ path: '/user', label: 'user', icon: 'folder' });
-      mnt.sort(ZF.naturalCompare);
-      for (var k = 0; k < mnt.length; k++) {
-        var m = /^(usb|ext)(\d+)$/.exec(mnt[k]);
-        if (!m) continue;
+
+      var mounts = res[1].slice().sort(function (a, b) { return ZF.naturalCompare(a.name, b.name); });
+      for (var k = 0; k < mounts.length; k++) {
+        var m = mounts[k] || {};
+        if (!m.path) continue;
+        /* Slot numbering is what users recognise on the console; the volume
+         * label stays available from /api/mounts for other views. */
         out.push({
-          path: '/mnt/' + mnt[k],
-          label: (m[1] === 'usb' ? 'USB drive ' : 'Extended storage ') + m[2],
+          path: m.path,
+          label: (m.kind === 'ext' ? 'Extended storage ' : 'USB drive ') + String(m.name || '').replace(/^[a-z]+/, ''),
           icon: 'drive'
         });
       }
@@ -1427,10 +1518,15 @@
     title: 'Files',
     enter: function (params, meta) {
       var path = P.norm(params.path || '/');
+      var revealTarget = pendingReveal && pendingReveal.dir === path ? pendingReveal : null;
+      pendingReveal = null;
+      var opts = { focus: meta && meta.userNav && !ZF.isTyping(document.activeElement) };
+      if (revealTarget) { opts.focusName = revealTarget.name; opts.select = true; }
       if (path !== S.path || S.error) {
-        load(path, { focus: meta && meta.userNav && !ZF.isTyping(document.activeElement) });
+        load(path, opts);
       } else {
-        load(path, { silent: true });
+        opts.silent = true;
+        load(path, opts);
       }
       renderPlaces();
     },
@@ -1442,6 +1538,7 @@
 
   ZF.files = {
     hashFor: hashFor,
+    reveal: reveal,
     current: function () { return S.path; },
     reload: reload
   };

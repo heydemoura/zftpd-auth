@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Build and installation guide
+    url: https://github.com/seregonwar/zftpd/blob/main/README.md
+    about: Check the documented build commands and how to load the payload before opening an issue.
+  - name: Technical documentation
+    url: https://github.com/seregonwar/zftpd/tree/main/docs
+    about: HTTP API reference, architecture notes and the game dumping specification.
+  - name: Support the project
+    url: https://www.seregonwar.com/donations
+    about: Donations are optional, but they keep the payloads coming.

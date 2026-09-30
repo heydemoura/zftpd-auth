@@ -355,6 +355,7 @@
     var dest = el('div', { class: 'picker-dest' });
     var err = el('div', { class: 'field-hint picker-note', role: 'status' });
     var names = [];
+    var chosen = null; /* file scelto, in modalità files */
     var seq = 0;
     var dialog;
 
@@ -371,9 +372,10 @@
 
     function update() {
       ZF.clear(dest);
-      dest.appendChild(document.createTextNode('Destination: '));
-      dest.appendChild(el('strong', { text: current }));
+      dest.appendChild(document.createTextNode(o.files ? 'Package: ' : 'Destination: '));
+      dest.appendChild(el('strong', { text: o.files ? (chosen || current) : current }));
       var msg = o.check ? o.check(current) : null;
+      if (o.files && !chosen) msg = msg || 'Choose a package';
       err.textContent = msg || '';
       if (dialog) dialog.buttons.ok.disabled = !!msg;
     }
@@ -389,17 +391,22 @@
         ZF.clear(list);
         names = [];
         var dirs = [];
+        var files = [];
         var entries = res.entries || [];
         for (var i = 0; i < entries.length; i++) {
           names.push(entries[i].name);
-          if (entries[i].type !== 'directory') continue;
+          if (entries[i].type !== 'directory') {
+            if (o.files && (!o.filter || o.filter(entries[i].name))) files.push(entries[i].name);
+            continue;
+          }
           if (!ZF.settings.showHidden && entries[i].name.charAt(0) === '.') continue;
           if (!ZF.settings.showProtected && ZF.isProtected(current, entries[i].name)) continue;
           dirs.push(entries[i].name);
         }
         dirs.sort(ZF.naturalCompare);
-        if (!dirs.length) {
-          list.appendChild(el('div', { class: 'picker-empty', text: 'No subfolders' }));
+        files.sort(ZF.naturalCompare);
+        if (!dirs.length && !files.length) {
+          list.appendChild(el('div', { class: 'picker-empty', text: o.files ? 'Nothing to choose here' : 'No subfolders' }));
           return;
         }
         for (var j = 0; j < dirs.length; j++) {
@@ -409,6 +416,18 @@
               onclick: function () { load(ZF.path.join(current, name)); }
             }, [ZF.icon('folder'), el('span', { text: name }), ZF.icon('chevron-right', 'ic-go')]));
           })(dirs[j]);
+        }
+        if (o.files) {
+          for (var k = 0; k < files.length; k++) {
+            (function (name) {
+              var full = ZF.path.join(current, name);
+              list.appendChild(el('button', {
+                type: 'button', class: 'picker-row' + (chosen === full ? ' is-selected' : ''),
+                role: 'option',
+                onclick: function () { chosen = full; update(); }
+              }, [ZF.icon('file'), el('span', { text: name })]));
+            })(files[k]);
+          }
         }
       }, function (e) {
         if (my !== seq) return;
@@ -432,12 +451,16 @@
         { id: 'ok', label: o.confirmLabel || 'Select', kind: 'primary', submit: true }
       ],
       onAction: function (id) {
+        if (id === 'ok' && o.files && !chosen) return false;
         if (id === 'ok' && o.check && o.check(current)) return false;
         return true;
       }
     });
     load(current);
-    return dialog.promise.then(function (id) { return id === 'ok' ? current : null; });
+    return dialog.promise.then(function (id) {
+      if (id !== 'ok') return null;
+      return o.files ? chosen : current;
+    });
   };
 
   /* ── Menus ──────────────────────────────────────────────────────────── */

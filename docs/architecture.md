@@ -56,7 +56,7 @@ creating tens of thousands of lines of generated C changes.
 ## External dependencies
 
 Do not reimplement mature network protocols inside zftpd.  HTTP/HTTPS/FTP/FTPS
-use libcurl and NFS uses libnfs.  PS5 consumes the PacBrew ports.  See
+use libcurl and NFS uses libnfs.  PS4 and PS5 consume the PacBrew ports.  See
 [`dependencies.md`](dependencies.md) for pinned versions and build details.
 
 ## Adding a feature

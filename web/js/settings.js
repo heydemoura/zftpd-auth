@@ -60,6 +60,62 @@
     return b;
   }
 
+  /* ── DNS filter ─────────────────────────────────────────────────────────
+   * The filter runs in the daemon, so this switch mirrors /api/dns/status
+   * instead of a local preference, and every flip is a POST that the payload
+   * remembers across reinjections.
+   */
+
+  var dnsState = { known: false, running: false, enabled: true, resolver: false, masks: 0, exceptions: 0 };
+
+  function loadDns() {
+    fetch('/api/dns/status', { credentials: 'same-origin' }).then(function (r) {
+      return r.json();
+    }).then(function (j) {
+      if (!j || j.ok !== true) return;
+      var changed = !dnsState.known || dnsState.running !== !!j.running ||
+        dnsState.enabled !== !!j.enabled || dnsState.resolver !== !!j.resolver;
+      dnsState = {
+        known: true, running: !!j.running, enabled: !!j.enabled, resolver: !!j.resolver,
+        masks: j.masks || 0, exceptions: j.exceptions || 0
+      };
+      if (changed) render();
+    }).catch(function () { /* Console unreachable: keep the last known state. */ });
+  }
+
+  function setDns(enable) {
+    fetch(enable ? '/api/dns/enable' : '/api/dns/disable', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': ZF.api.csrf() }
+    }).then(function (r) {
+      return r.json();
+    }).then(function (j) {
+      if (!j) return;
+      ZF.toast(j.message || (enable ? 'DNS filter enabled' : 'DNS filter disabled'),
+        { type: j.ok ? 'success' : 'error' });
+      loadDns();
+    }).catch(function () {
+      ZF.toast('Could not reach the console', { type: 'error' });
+      loadDns();
+    });
+  }
+
+  function dnsSwitch() {
+    var input = el('input', {
+      type: 'checkbox', checked: !!dnsState.running, disabled: !!dnsState.resolver || !dnsState.known,
+      'aria-label': 'Block Sony CDN (DNS)',
+      onchange: function () { setDns(input.checked); }
+    });
+    return el('label', { class: 'switch' }, [input, el('span')]);
+  }
+
+  function dnsStatusText() {
+    if (!dnsState.known) return 'Checking…';
+    if (dnsState.resolver) return 'another resolver already serves this console';
+    if (!dnsState.running) return dnsState.enabled ? 'Not running — port 53 is busy' : 'Disabled';
+    return dnsState.masks + ' Sony masks blackholed · ' + dnsState.exceptions + ' exceptions forwarded';
+  }
+
   function shortcuts() {
     var list = [
       ['Open item', 'Enter'], ['Parent folder', 'Backspace or Alt+\u2191'], ['Back / forward', 'Alt+\u2190 / Alt+\u2192'],
@@ -80,6 +136,7 @@
   function render() {
     ZF.clear(body);
     var info = ZF.api.info || {};
+    loadDns();
 
     body.appendChild(section('Appearance', [
       setting('Theme', 'System follows your device setting.', segmented('theme', [
@@ -98,8 +155,18 @@
     ]));
 
     body.appendChild(section('Downloads', [
-      setting('Save downloads to', 'Default folder for downloads started from a URL.', pathButton('downloadDest', 'Save downloads to'))
+      setting('Save downloads to', 'Default folder for downloads started from a URL.', pathButton('downloadDest', 'Save downloads to')),
+      setting('Decrypt protected files', 'Console .self files download as the decrypted executable instead of the encrypted container. Other files are always sent untouched.',
+        toggle('decryptSelf', 'Decrypt protected files'))
     ]));
+
+    var dnsRows = [
+      setting('Block Sony CDN (DNS)',
+        'Answers the Sony content-delivery names with 0.0.0.0 so the console stops downloading from them. Point this console\'s DNS server at this address to use it.',
+        dnsSwitch()),
+      setting('Filter state', dnsStatusText(), el('span', { class: 'mono', text: dnsState.running ? 'Active' : 'Off' }))
+    ];
+    body.appendChild(section('Network', dnsRows));
 
     body.appendChild(section('About', [
       about(info),
