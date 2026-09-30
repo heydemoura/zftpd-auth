@@ -35,37 +35,39 @@ static int send_all(int fd, const void *buf, size_t len) {
 
 static void *http_server(void *opaque) {
   server_ctx_t *ctx = (server_ctx_t *)opaque;
-  int client = accept(ctx->listen_fd, NULL, NULL);
-  if (client < 0) {
-    ctx->failed = 1;
-    return NULL;
-  }
+  /* The first request probes range support; this server ignores Range, so
+   * the downloader must fall back to its ordinary single-stream request. */
+  for (int request_idx = 0; request_idx < 2; request_idx++) {
+    int client = accept(ctx->listen_fd, NULL, NULL);
+    if (client < 0) {
+      ctx->failed = 1;
+      return NULL;
+    }
 
-  char request[4096];
-  size_t used = 0U;
-  while (used + 1U < sizeof(request)) {
-    ssize_t n = recv(client, request + used, sizeof(request) - used - 1U, 0);
-    if (n <= 0) break;
-    used += (size_t)n;
-    request[used] = '\0';
-    if (strstr(request, "\r\n\r\n") != NULL) break;
-  }
-  if (used == 0U || strstr(request, "GET /file.bin ") == NULL) {
-    ctx->failed = 1;
-  }
+    char request[4096];
+    size_t used = 0U;
+    while (used + 1U < sizeof(request)) {
+      ssize_t n = recv(client, request + used, sizeof(request) - used - 1U, 0);
+      if (n <= 0) break;
+      used += (size_t)n;
+      request[used] = '\0';
+      if (strstr(request, "\r\n\r\n") != NULL) break;
+    }
+    if (used == 0U || strstr(request, "GET /file.bin ") == NULL)
+      ctx->failed = 1;
 
-  char header[256];
-  int hn = snprintf(header, sizeof(header),
-                    "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n"
-                    "Content-Type: application/octet-stream\r\n"
-                    "Connection: close\r\n\r\n",
-                    strlen(k_payload));
-  if (hn <= 0 || (size_t)hn >= sizeof(header) ||
-      send_all(client, header, (size_t)hn) != 0 ||
-      send_all(client, k_payload, strlen(k_payload)) != 0) {
-    ctx->failed = 1;
+    char header[256];
+    int hn = snprintf(header, sizeof(header),
+                      "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Connection: close\r\n\r\n",
+                      strlen(k_payload));
+    if (hn <= 0 || (size_t)hn >= sizeof(header) ||
+        send_all(client, header, (size_t)hn) != 0 ||
+        send_all(client, k_payload, strlen(k_payload)) != 0)
+      ctx->failed = 1;
+    (void)close(client);
   }
-  (void)close(client);
   return NULL;
 }
 
@@ -97,6 +99,16 @@ int main(void) {
     fprintf(stderr, "expected curl URL schemes to be supported: %s\n", reason);
     return 1;
   }
+#if defined(ENABLE_LIBTORRENT) && ENABLE_LIBTORRENT
+  if (!transfer_url_supported(
+          "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&dn=test",
+          reason, sizeof(reason)) ||
+      transfer_url_supported("magnet:?xt=urn:btih:invalid", reason,
+                             sizeof(reason))) {
+    fprintf(stderr, "magnet validation failed: %s\n", reason);
+    return 1;
+  }
+#endif
 
   int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd < 0) return 1;
@@ -125,13 +137,15 @@ int main(void) {
   (void)snprintf(url, sizeof(url), "http://127.0.0.1:%u/file.bin",
                  (unsigned)ntohs(addr.sin_port));
   int id = 0;
+  int queued = 0;
   char name[TRANSFER_NAME_MAX];
   char error[TRANSFER_ERROR_MAX];
-  if (transfer_start(url, tmp_dir, &id, name, sizeof(name), error,
+  if (transfer_start(url, tmp_dir, &id, &queued, name, sizeof(name), error,
                      sizeof(error)) != 0) {
     fprintf(stderr, "transfer_start failed: %s\n", error);
     return 1;
   }
+  if (queued != 0) return 1;
 
   transfer_snapshot_t snap;
   if (wait_for_transfer(id, &snap) != 0) {
