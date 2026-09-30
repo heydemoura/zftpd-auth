@@ -323,6 +323,35 @@ static int test_app_pkg_install_name(void) {
   return 0;
 }
 
+/*
+ * PS5 console-format packages keep no readable param.sfo: the display name
+ * lives in the appmeta param.json, plain UTF-8 with CRLF line endings and
+ * nested under localizedParameters (the first titleName is the default
+ * language's).
+ */
+static int test_ps5_param_json_name(void) {
+  static const char json[] =
+      "{\r\n"
+      "  \"localizedParameters\": {\r\n"
+      "    \"defaultLanguage\": \"en-US\",\r\n"
+      "    \"en-US\": {\r\n"
+      "      \"titleName\": \"Call of Duty\xc2\xae Modern Warfare 3\"\r\n"
+      "    }\r\n"
+      "  },\r\n"
+      "  \"titleId\": \"PPSA24264\",\r\n"
+      "  \"contentId\": \"UP0000-PPSA24264_00-EXAMPLE000000000\"\r\n"
+      "}\r\n";
+
+  char out[128];
+  CHECK(games_json_get_string(json, "titleName", out, sizeof(out)) == 0);
+  CHECK(strcmp(out, "Call of Duty\xc2\xae Modern Warfare 3") == 0);
+
+  char id[32];
+  CHECK(games_json_get_string(json, "titleId", id, sizeof(id)) == 0);
+  CHECK(strcmp(id, "PPSA24264") == 0);
+  return 0;
+}
+
 int main(void) {
   CHECK(test_sfo() == 0);
   CHECK(test_json_and_ids() == 0);
@@ -330,6 +359,7 @@ int main(void) {
   CHECK(test_game_routes() == 0);
   CHECK(test_icon_route() == 0);
   CHECK(test_app_pkg_install_name() == 0);
+  CHECK(test_ps5_param_json_name() == 0);
   puts("test_http_games: ok");
   return 0;
 }

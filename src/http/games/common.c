@@ -262,36 +262,100 @@ static int games_load_installed_sfo(const char *app_dir, uint8_t **out_data,
   return rc;
 }
 
+/**
+ * Display name of a title whose package cannot be read.
+ *
+ * PS5 packages (console format, magic 0x7F "FIH") hold no readable param.sfo,
+ * but the system keeps the metadata in the appmeta directory: param.json with
+ * the localized name in plain UTF-8, the first entry belonging to the default
+ * language.
+ *
+ * @return 0 when a name was extracted.
+ */
+static int games_read_appmeta_title(const char *title_id, char *title_name,
+                                    size_t title_name_size) {
+  static const char *const roots[] = {"/user/appmeta",
+                                      "/system_data/priv/appmeta", NULL};
+  if (title_id == NULL || title_id[0] == '\0' || title_name == NULL ||
+      title_name_size < 2U) {
+    return -1;
+  }
+
+  for (size_t i = 0U; roots[i] != NULL; i++) {
+    char path[FTP_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s/param.json", roots[i], title_id);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+      continue;
+    }
+
+    uint8_t *raw = NULL;
+    size_t size = 0U;
+    if (games_read_file(path, &raw, &size, 65536U) != 0) {
+      continue;
+    }
+
+    /* games_json_get_string() needs a terminated buffer. */
+    char *text = (char *)malloc(size + 1U);
+    if (text == NULL) {
+      free(raw);
+      return -1;
+    }
+    memcpy(text, raw, size);
+    text[size] = '\0';
+    free(raw);
+
+    int ok = games_json_get_string(text, "titleName", title_name,
+                                   title_name_size) == 0 &&
+             title_name[0] != '\0';
+    free(text);
+    if (ok) {
+      return 0;
+    }
+  }
+  return -1;
+}
+
 int games_read_installed_sfo(const char *app_dir, char *title_id,
                                    size_t title_id_size, char *title_name,
                                    size_t title_name_size) {
   if ((app_dir == NULL) || (title_id == NULL) || (title_name == NULL)) {
     return -1;
   }
+  title_name[0] = '\0';
 
+  int have_sfo = 0;
   uint8_t *sfo = NULL;
   size_t sfo_size = 0U;
-  if (games_load_installed_sfo(app_dir, &sfo, &sfo_size) != 0) {
-    return -1;
+  if (games_load_installed_sfo(app_dir, &sfo, &sfo_size) == 0) {
+    have_sfo = 1;
+
+    /* The title id is already known from the directory name; a missing
+     * TITLE_ID must not erase it. */
+    char id_fallback[64] = {0};
+    (void)snprintf(id_fallback, sizeof(id_fallback), "%.63s", title_id);
+
+    (void)games_sfo_get_string(sfo, sfo_size, "TITLE_ID", title_id,
+                               title_id_size);
+    if (title_id[0] == '\0') {
+      (void)snprintf(title_id, title_id_size, "%s", id_fallback);
+    }
+    (void)games_sfo_get_string(sfo, sfo_size, "TITLE", title_name,
+                               title_name_size);
+    if (title_name[0] == '\0') {
+      (void)games_sfo_get_string(sfo, sfo_size, "TITLE_01", title_name,
+                                 title_name_size);
+    }
+
+    free(sfo);
   }
 
-  /* The title id is already known from the directory name; a missing
-   * TITLE_ID must not erase it. */
-  char id_fallback[64] = {0};
-  (void)snprintf(id_fallback, sizeof(id_fallback), "%.63s", title_id);
-
-  (void)games_sfo_get_string(sfo, sfo_size, "TITLE_ID", title_id, title_id_size);
-  if (title_id[0] == '\0') {
-    (void)snprintf(title_id, title_id_size, "%s", id_fallback);
-  }
-  (void)games_sfo_get_string(sfo, sfo_size, "TITLE", title_name, title_name_size);
+  /* Packages whose param.sfo cannot be read (PS5 console format) still have
+   * their name in the system metadata. */
   if (title_name[0] == '\0') {
-    (void)games_sfo_get_string(sfo, sfo_size, "TITLE_01", title_name,
-                         title_name_size);
+    (void)games_read_appmeta_title(title_id, title_name, title_name_size);
   }
 
-  free(sfo);
-  return 0;
+  return (have_sfo || title_name[0] != '\0') ? 0 : -1;
 }
 
 #if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
