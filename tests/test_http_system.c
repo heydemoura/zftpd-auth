@@ -71,6 +71,34 @@ int main(void) {
   CHECK(response_is(resp, 405));
   http_response_destroy(resp);
 
+  /* Mounts: the host has no /mnt/usbN, and a plain directory must never be
+   * reported as a volume. */
+  resp = request(HTTP_METHOD_GET, "/api/mounts");
+  CHECK(response_is(resp, 200));
+  CHECK(strstr(resp->data, "\"mounts\":[]") != NULL);
+  http_response_destroy(resp);
+
+  /* Blu-ray drive: the host build has no device node, so the state reports
+   * no drive and the eject answers a soft failure naming the real reason. */
+  resp = request(HTTP_METHOD_GET, "/api/system/disc");
+  CHECK(response_is(resp, 200));
+  CHECK(strstr(resp->data, "\"present\":false") != NULL);
+  http_response_destroy(resp);
+
+  resp = request(HTTP_METHOD_POST, "/api/system/eject");
+  CHECK(response_is(resp, 200));
+  CHECK(strstr(resp->data, "\"ok\":false") != NULL);
+  CHECK(strstr(resp->data, "not available") != NULL);
+  http_response_destroy(resp);
+
+  resp = request(HTTP_METHOD_GET, "/api/system/eject");
+  CHECK(response_is(resp, 405));
+  http_response_destroy(resp);
+
+  resp = request(HTTP_METHOD_POST, "/api/system/disc");
+  CHECK(response_is(resp, 405));
+  http_response_destroy(resp);
+
   resp = request(HTTP_METHOD_GET, "/api/notify");
   CHECK(response_is(resp, 400));
   http_response_destroy(resp);
