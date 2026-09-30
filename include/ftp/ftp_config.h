@@ -43,7 +43,7 @@ SOFTWARE.
  *===========================================================================*/
 
 #ifndef RELEASE_VERSION
-#define RELEASE_VERSION "1.5.0"
+#define RELEASE_VERSION "1.6.0"
 #endif
 
 /*===========================================================================*
@@ -180,34 +180,10 @@ SOFTWARE.
 #define FTP_LIST_LINE_SIZE 512U
 #endif
 
-/*===========================================================================*
- * PATH LIMITS (Platform-dependent)
- *===========================================================================*/
-
-#if defined(PS4) || defined(PS5) || defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
-/**
- * PlayStation maximum path length
- * @note PS4/PS5 use custom BSD with 1024-byte limit
- */
+/* Filesystem path capacity is platform-owned; keep the FTP name as an ABI alias. */
+#include "pal_limits.h"
 #ifndef FTP_PATH_MAX
-#define FTP_PATH_MAX 1024U
-#endif
-#elif defined(PS3)
-/**
- * PlayStation 3 maximum path length
- * @note PS3 has more limited path support
- */
-#ifndef FTP_PATH_MAX
-#define FTP_PATH_MAX 512U
-#endif
-#else
-/**
- * POSIX maximum path length
- * @note Linux typically supports 4096 bytes
- */
-#ifndef FTP_PATH_MAX
-#define FTP_PATH_MAX 4096U
-#endif
+#define FTP_PATH_MAX PAL_PATH_MAX
 #endif
 
 /**
@@ -374,32 +350,9 @@ SOFTWARE.
 #define FTP_SENDFILE_EAGAIN_SLEEP_US 500U /* 0.5 ms — PS5 LAN RTT ~0.1-0.3ms, 1ms era eccessivo */
 #endif
 
-/**
- * DESIGN RATIONALE - distinct from PAL_FILE_WRITE_CHUNK_MAX:
- *
- *   PAL_FILE_WRITE_CHUNK_MAX (64 KB on PS4, 128 KB on PS5) was designed
- *   to keep per-chunk PFS WRITE latency under ~5 ms in the STOR
- *   double-buffer path so the FTP recv thread never starves the TCP
- *   receive window.  It is a WRITE latency constraint, not a READ one.
- *
- *   Using it in cmd_RETR sendfile() penalises downloads with 4-8x the
- *   number of syscalls compared to the HTTP server (512 KB chunks).
- *   Each unnecessary syscall boundary:
- *     - re-acquires the socket lock
- *     - may flush a partial TCP_CORK/TCP_NOPUSH window prematurely
- *     - triggers a false "driver stall" if the send buffer is momentarily
- *       full (TCP back-pressure) before sufficient ACKs have arrived
- *
- *   512 KB is:
- *     - below the PS5 sendfile EAGAIN threshold (>= 1 MB)
- *     - large enough that one chunk fills the BDP on most internet paths
- *     - the value HTTP /api/download already uses (HTTP_SENDFILE_CHUNK_SIZE)
- *
- * @see cmd_RETR in ftp_commands.c
- * @see HTTP_SENDFILE_CHUNK_SIZE in http_config.h
- */
+/** FTP RETR sendfile chunk size. */
 #ifndef FTP_RETR_SENDFILE_CHUNK
-#define FTP_RETR_SENDFILE_CHUNK (2U * 1024U * 1024U) /* 2 MB — PS5 NVMe: meno syscall boundary, meno TCP flush prematuri */
+#define FTP_RETR_SENDFILE_CHUNK (2U * 1024U * 1024U)
 #endif
 
 /**

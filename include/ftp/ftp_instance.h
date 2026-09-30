@@ -33,6 +33,7 @@ SOFTWARE.
 #ifndef FTP_INSTANCE_H
 #define FTP_INSTANCE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -54,6 +55,32 @@ uint64_t ftp_daemon_instance_id(void);
  * @brief CLOCK_MONOTONIC nanoseconds captured at first identity generation.
  */
 uint64_t ftp_daemon_start_monotonic_ns(void);
+
+/**
+ * @brief Format the control identity line ("<pid> <token hex>\n").
+ * @return 0 on success, -1 when the buffer cannot hold the line.
+ */
+int ftp_instance_identity_format(char *out, size_t capacity, int pid,
+                                 uint64_t token);
+
+/**
+ * @brief Parse a control identity line written by the formatter.
+ * @return 0 when the line is complete and the pid is usable, -1 otherwise.
+ */
+int ftp_instance_identity_parse(const char *text, int *pid, uint64_t *token);
+
+/**
+ * @brief Format the cooperative shutdown request ("STOP <token hex>\n").
+ * @return 0 on success, -1 when the buffer cannot hold the command.
+ */
+int ftp_instance_stop_command_format(char *out, size_t capacity,
+                                     uint64_t token);
+
+/**
+ * @brief Parse a cooperative shutdown request.
+ * @return 0 when the line is exactly the command, -1 otherwise.
+ */
+int ftp_instance_stop_command_parse(const char *line, uint64_t *token);
 
 #ifdef __cplusplus
 }

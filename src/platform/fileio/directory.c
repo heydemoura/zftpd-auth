@@ -100,6 +100,32 @@ ftp_error_t pal_dir_create(const char *path, mode_t mode) {
 /**
  * @brief Remove directory
  */
+ftp_error_t pal_dir_create_recursive(const char *path, mode_t mode) {
+  if (path == NULL || path[0] == '\0') return FTP_ERR_INVALID_PARAM;
+  size_t len = strlen(path);
+  if (len >= FTP_PATH_MAX) return FTP_ERR_PATH_TOO_LONG;
+
+  char work[FTP_PATH_MAX];
+  memcpy(work, path, len + 1U);
+  for (size_t i = 1U; i <= len; i++) {
+    if (work[i] != '/' && work[i] != '\0') continue;
+    char saved = work[i];
+    work[i] = '\0';
+    if (work[0] != '\0') {
+      ftp_error_t err = pal_dir_create(work, mode);
+      if (err == FTP_ERR_DIR_EXISTS) {
+        int is_dir = pal_path_is_directory(work);
+        if (is_dir != 1) return is_dir < 0 ? (ftp_error_t)is_dir
+                                           : FTP_ERR_INVALID_PARAM;
+      } else if (err != FTP_OK) {
+        return err;
+      }
+    }
+    work[i] = saved;
+  }
+  return FTP_OK;
+}
+
 ftp_error_t pal_dir_remove(const char *path) {
   if (path == NULL) {
     return FTP_ERR_INVALID_PARAM;

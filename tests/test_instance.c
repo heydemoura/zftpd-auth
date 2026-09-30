@@ -32,6 +32,7 @@ SOFTWARE.
 
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 
 int main(void) {
   ftp_instance_init();
@@ -63,6 +64,48 @@ int main(void) {
   if (pal_errno_is_listener_lost(EAGAIN)) return 9;
 
   if (pal_listen_fd_alive(-1) != 0) return 10;
+
+  char line[80];
+  char command[64];
+  int pid = 0;
+  uint64_t token = 0U;
+
+  if (ftp_instance_identity_format(line, sizeof(line), 4242, 0x0123456789abcdefULL) != 0)
+    return 11;
+  if (strcmp(line, "4242 0123456789abcdef\n") != 0) return 12;
+  if (ftp_instance_identity_parse(line, &pid, &token) != 0 || pid != 4242 ||
+      token != 0x0123456789abcdefULL)
+    return 13;
+
+  /* A buffer that cannot hold the whole line is refused, never truncated. */
+  if (ftp_instance_identity_format(line, 4U, 4242, 1U) == 0) return 14;
+  if (ftp_instance_identity_format(line, sizeof(line), 1, 1U) == 0) return 15;
+
+  /* Malformed instance files must not look like a live payload. */
+  if (ftp_instance_identity_parse("not-a-pid\n", &pid, &token) == 0) return 16;
+  if (ftp_instance_identity_parse("1 abc\n", &pid, &token) == 0) return 17;
+  if (ftp_instance_identity_parse("4242 \n", &pid, &token) == 0) return 18;
+  if (ftp_instance_identity_parse("4242 abc trailing\n", &pid, &token) == 0) return 19;
+  if (ftp_instance_identity_parse("4242 abc", &pid, &token) != 0 ||
+      token != 0xabcULL)
+    return 20;
+
+  if (ftp_instance_stop_command_format(command, sizeof(command),
+                                       0xfeedfacecafebeefULL) != 0)
+    return 21;
+  if (strcmp(command, "STOP feedfacecafebeef\n") != 0) return 22;
+  if (ftp_instance_stop_command_parse(command, &token) != 0 ||
+      token != 0xfeedfacecafebeefULL)
+    return 23;
+
+  /* Only the exact command is accepted: a stray token or a different verb
+   * must never stop a running payload. */
+  if (ftp_instance_stop_command_parse("STOP feedfacecafebeef extra\n", &token) == 0)
+    return 24;
+  if (ftp_instance_stop_command_parse("stop feedfacecafebeef\n", &token) == 0)
+    return 25;
+  if (ftp_instance_stop_command_parse("STOP\n", &token) == 0) return 26;
+  if (ftp_instance_stop_command_format(command, 6U, 1U) == 0) return 27;
 
   printf("test_instance: ok (id=%016llx start=%llu)\n",
          (unsigned long long)id1, (unsigned long long)start1);

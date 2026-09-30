@@ -105,6 +105,32 @@ static int test_sendfile_path(const char *path) {
   return 0;
 }
 
+static int test_recursive_mkdir(void) {
+  char root[] = "/tmp/zftpd-mkdir-XXXXXX";
+  CHECK(mkdtemp(root) != NULL);
+
+  char nested[FTP_PATH_MAX];
+  CHECK(snprintf(nested, sizeof(nested), "%s/a/b/c", root) > 0);
+  CHECK(pal_dir_create_recursive(nested, 0700) == FTP_OK);
+  CHECK(pal_path_is_directory(nested) == 1);
+
+  char conflict[FTP_PATH_MAX], child[FTP_PATH_MAX];
+  CHECK(snprintf(conflict, sizeof(conflict), "%s/file", root) > 0);
+  int fd = open(conflict, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  CHECK(fd >= 0);
+  CHECK(close(fd) == 0);
+  CHECK(snprintf(child, sizeof(child), "%s/child", conflict) > 0);
+  CHECK(pal_dir_create_recursive(child, 0700) == FTP_ERR_INVALID_PARAM);
+
+  CHECK(unlink(conflict) == 0);
+  CHECK(rmdir(nested) == 0);
+  char b[FTP_PATH_MAX], a[FTP_PATH_MAX];
+  CHECK(snprintf(b, sizeof(b), "%s/a/b", root) > 0);
+  CHECK(snprintf(a, sizeof(a), "%s/a", root) > 0);
+  CHECK(rmdir(b) == 0 && rmdir(a) == 0 && rmdir(root) == 0);
+  return 0;
+}
+
 int main(void) {
   char path[] = "/tmp/zftpd-fileio-basic-XXXXXX";
   int seed_fd = mkstemp(path);
@@ -113,6 +139,7 @@ int main(void) {
 
   CHECK(test_basic_io(path) == 0);
   CHECK(test_sendfile_path(path) == 0);
+  CHECK(test_recursive_mkdir() == 0);
   CHECK(pal_file_stat(path, &(struct stat){0}) == FTP_OK);
   CHECK(pal_file_delete(path) == FTP_OK);
   CHECK(pal_file_stat(path, &(struct stat){0}) == FTP_ERR_NOT_FOUND);

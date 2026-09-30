@@ -68,6 +68,8 @@ SOFTWARE.
  * Callers must handle partial transfers and EAGAIN.
  */
 ssize_t pal_sendfile(int sock_fd, int file_fd, off_t *offset, size_t count);
+ssize_t pal_sendfile_retry(int sock_fd, int file_fd, off_t *offset, size_t count,
+                           unsigned retries, unsigned sleep_us);
 int pal_file_error_is_fatal(int error);
 
 /*===========================================================================*
@@ -277,6 +279,7 @@ ftp_error_t pal_file_copy_recursive_ex(const char *src, const char *dst,
  * @pre path != NULL
  */
 ftp_error_t pal_dir_create(const char *path, mode_t mode);
+ftp_error_t pal_dir_create_recursive(const char *path, mode_t mode);
 
 /**
  * @brief Remove directory

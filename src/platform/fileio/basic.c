@@ -30,14 +30,6 @@ SOFTWARE.
 #include <string.h>
 #include <unistd.h>
 
-#if defined(PLATFORM_PS5) || defined(PS5)
-#define PAL_FILE_WRITE_CHUNK_MAX (1024U * 1024U)
-#elif defined(PLATFORM_PS4) || defined(PS4)
-#define PAL_FILE_WRITE_CHUNK_MAX (64U * 1024U)
-#else
-#define PAL_FILE_WRITE_CHUNK_MAX (256U * 1024U)
-#endif
-
 #if defined(PLATFORM_PS4) || defined(PS4)
 #define PS4_SYS_FTRUNCATE 480
 #endif
@@ -179,12 +171,7 @@ ssize_t pal_file_write_all(int fd, const void *buffer, size_t count) {
   size_t total = 0U;
 
   while (total < count) {
-    size_t remaining = count - total;
-    size_t chunk = remaining;
-    if (chunk > (size_t)PAL_FILE_WRITE_CHUNK_MAX) {
-      chunk = (size_t)PAL_FILE_WRITE_CHUNK_MAX;
-    }
-    ssize_t n = write(fd, p + total, chunk);
+    ssize_t n = write(fd, p + total, count - total);
     if (n > 0) {
       total += (size_t)n;
       continue;

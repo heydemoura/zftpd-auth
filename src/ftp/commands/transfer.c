@@ -189,9 +189,9 @@ static void upload_sync_file(int fd, int success) {
   (void)fd;
   (void)success;
 #elif defined(__linux__)
-  if (success != 0) (void)fdatasync(fd);
+  if (success != 0 && fd >= 0) (void)fdatasync(fd);
 #else
-  if (success != 0) (void)fsync(fd);
+  if (success != 0 && fd >= 0) (void)fsync(fd);
 #endif
 }
 
@@ -326,83 +326,23 @@ ftp_error_t cmd_RETR(ftp_session_t *session, const char *args) {
   pal_socket_cork(session->data_fd);
 
   while (remaining > 0U) {
-    ssize_t sent =
-        pal_sendfile(session->data_fd, node.fd, &offset,
-                     (remaining > (size_t)FTP_RETR_SENDFILE_CHUNK)
-                         ? (size_t)FTP_RETR_SENDFILE_CHUNK
-                         : remaining);
+    size_t chunk = remaining > (size_t)FTP_RETR_SENDFILE_CHUNK
+                       ? (size_t)FTP_RETR_SENDFILE_CHUNK
+                       : remaining;
+    ssize_t sent = pal_sendfile_retry(
+        session->data_fd, node.fd, &offset, chunk,
+        FTP_SENDFILE_EAGAIN_RETRIES, FTP_SENDFILE_EAGAIN_SLEEP_US);
+    if (sent <= 0) break;
 
-    if (sent > 0) {
-      remaining -= (size_t)sent;
-      bytes_sent += (uint64_t)sent;
-      session->last_activity = time(NULL);
-      atomic_fetch_add(&session->stats.bytes_sent, (uint64_t)sent);
-
-      /* Evict pages already sent from the kernel page cache. */
+    remaining -= (size_t)sent;
+    bytes_sent += (uint64_t)sent;
+    session->last_activity = time(NULL);
+    atomic_fetch_add(&session->stats.bytes_sent, (uint64_t)sent);
 #if defined(POSIX_FADV_DONTNEED) && !defined(PLATFORM_PS4) && !defined(PS4)
-      if (node.fd >= 0) {
-        off_t evict_start = offset - (off_t)sent;
-        if (evict_start >= 0) {
-          (void)posix_fadvise(node.fd, evict_start,
-                              (off_t)sent, POSIX_FADV_DONTNEED);
-        }
-      }
+    off_t evict_start = offset - (off_t)sent;
+    if (node.fd >= 0 && evict_start >= 0)
+      (void)posix_fadvise(node.fd, evict_start, (off_t)sent, POSIX_FADV_DONTNEED);
 #endif
-      continue;
-    }
-
-    if ((sent < 0) && (errno == EINTR)) {
-      continue;
-    }
-
-    /* Retrying a bad vnode can panic PS4/PS5, so storage faults are terminal. */
-    if ((sent < 0) && pal_file_error_is_fatal(errno)) {
-      remaining = 1U;
-      break;
-    }
-
-    /* Retry bounded TCP back-pressure/driver stalls. */
-    {
-      int recovered = 0;
-      for (int r = 0; r < FTP_SENDFILE_EAGAIN_RETRIES; r++) {
-        usleep(FTP_SENDFILE_EAGAIN_SLEEP_US);
-        ssize_t r_sent =
-            pal_sendfile(session->data_fd, node.fd, &offset,
-                         (remaining > (size_t)FTP_RETR_SENDFILE_CHUNK)
-                             ? (size_t)FTP_RETR_SENDFILE_CHUNK
-                             : remaining);
-        if (r_sent > 0) {
-          remaining -= (size_t)r_sent;
-          bytes_sent += (uint64_t)r_sent;
-          session->last_activity = time(NULL);
-          atomic_fetch_add(&session->stats.bytes_sent, (uint64_t)r_sent);
-#if defined(POSIX_FADV_DONTNEED) && !defined(PLATFORM_PS4) && !defined(PS4)
-          if (node.fd >= 0) {
-            off_t evict_start = offset - (off_t)r_sent;
-            if (evict_start >= 0) {
-              (void)posix_fadvise(node.fd, evict_start,
-                                  (off_t)r_sent, POSIX_FADV_DONTNEED);
-            }
-          }
-#endif
-          recovered = 1;
-          break;
-        }
-        if ((r_sent < 0) && (errno == EINTR)) {
-          r--; /* don't count EINTR as a retry */
-        }
-        if ((r_sent < 0) && pal_file_error_is_fatal(errno)) {
-          break;
-        }
-      }
-
-      if (recovered) {
-        continue;
-      }
-    }
-
-    remaining = 1U;
-    break;
   }
 
   pal_socket_uncork(session->data_fd);
@@ -539,9 +479,9 @@ ftp_error_t cmd_STOR(ftp_session_t *session, const char *args) {
   int fd = -1;
   err = upload_open_file(session, write_path, open_flags,
                          "Cannot create file.", &fd);
-  if (err != FTP_OK) {
+  if (err != FTP_OK || fd < 0) {
     if (use_atomic != 0) (void)unlink(tmp_path);
-    return err;
+    return err != FTP_OK ? err : FTP_ERR_FILE_OPEN;
   }
 
   if (session->restart_offset > 0) {
@@ -741,7 +681,8 @@ ftp_error_t cmd_APPE(ftp_session_t *session, const char *args) {
 
   int fd = -1;
   err = upload_open_file(session, resolved, open_flags, "Cannot open file.", &fd);
-  if (err != FTP_OK) return err;
+  if (err != FTP_OK || fd < 0)
+    return err != FTP_OK ? err : FTP_ERR_FILE_OPEN;
 
   if (session->restart_offset > 0 &&
       lseek(fd, session->restart_offset, SEEK_SET) < 0) {

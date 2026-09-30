@@ -104,3 +104,20 @@ ssize_t pal_sendfile(int sock_fd, int file_fd, off_t *offset, size_t count) {
   return nsent;
 #endif
 }
+ssize_t pal_sendfile_retry(int sock_fd, int file_fd, off_t *offset, size_t count,
+                           unsigned retries, unsigned sleep_us) {
+  unsigned attempt = 0U;
+  for (;;) {
+    ssize_t sent = pal_sendfile(sock_fd, file_fd, offset, count);
+    if (sent > 0) return sent;
+    int error = errno;
+    if (error == EINTR) continue;
+    if (sent < 0 && pal_file_error_is_fatal(error)) return -1;
+    if (error != EAGAIN && error != EWOULDBLOCK) return sent;
+    if (attempt++ >= retries) {
+      errno = error;
+      return -1;
+    }
+    if (sleep_us > 0U) usleep(sleep_us);
+  }
+}

@@ -518,8 +518,6 @@ pal_file_copy_atomic_ex(const char *src_path, const char *dst_path,
   } /* end serial for(;;) loop */
   } /* end serial_written scope */
 
-  out_err = FTP_OK;
-
 copy_done:;
 
   /* Evict only clean source pages; DONTNEED on writable PFS fds can force a costly sync. */
