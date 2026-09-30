@@ -3,12 +3,6 @@
  * Supports Store (0) and Deflate (8) compression methods.
  * Works on all platforms including PS4/PS5 without libarchive.
  *
- * API:
- *   builtin_unzip(const char *zip_path, const char *dest_dir,
- *                 volatile int *cancelled,
- *                 char *error_msg, size_t error_msg_size)
- *     → 0 on success, -1 on error
- *
  * ZIP format reference: PKWARE APPNOTE.TXT v6.3.4
  * Deflate reference:    RFC 1951
  * ═════════════════════════════════════════════════════════════════════════ */
@@ -18,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,13 +23,13 @@ extern "C" {
  *
  * @param zip_path         Path to the ZIP file.
  * @param dest_dir         Destination directory (must exist).
- * @param cancelled        Pointer to a volatile flag — set to 1 to abort.
+ * @param cancelled        Atomic cancellation flag; set to 1 to abort.
  * @param error_msg        Buffer for error message on failure.
  * @param error_msg_size   Size of error_msg buffer.
  * @return 0 on success, -1 on failure (error_msg is populated).
  */
 int builtin_unzip(const char *zip_path, const char *dest_dir,
-                  volatile int *cancelled,
+                  _Atomic int *cancelled,
                   char *error_msg, size_t error_msg_size);
 
 #ifdef __cplusplus
