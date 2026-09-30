@@ -123,7 +123,10 @@ bool pal_dns_override_for(const char *name, uint8_t ip[4]) {
 
 static int g_dns_udp_fd = -1;
 static int g_dns_tcp_fd = -1;
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
+/* Only the console builds run the resolver loops that watch this flag. */
 static bool g_dns_stop = false;
+#endif
 static pthread_t g_dns_udp_thread;
 static pthread_t g_dns_tcp_thread;
 static bool g_dns_udp_live = false;
@@ -482,7 +485,9 @@ int pal_dns_filter_start(void) {
 }
 
 void pal_dns_filter_stop(void) {
+#if defined(PLATFORM_PS4) || defined(PLATFORM_PS5)
   g_dns_stop = true;
+#endif
 
   /*
    * Wake both loops, wait for them to leave, and only then close the sockets:

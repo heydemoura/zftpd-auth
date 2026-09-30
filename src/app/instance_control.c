@@ -38,8 +38,6 @@
 #define KINFO_THREAD_SIZE 20U
 
 static int g_control_fd = -1;
-static pthread_t g_control_thread;
-static int g_control_thread_started;
 static uint64_t g_token;
 static volatile sig_atomic_t g_control_running;
 
@@ -350,7 +348,8 @@ int instance_control_start(void) {
   pthread_attr_t attr;
   int detached = pthread_attr_init(&attr) == 0 &&
                  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0;
-  int created = pthread_create(&g_control_thread, detached ? &attr : NULL,
+  pthread_t thread;
+  int created = pthread_create(&thread, detached ? &attr : NULL,
                                control_loop, NULL);
   if (detached) {
     (void)pthread_attr_destroy(&attr);
@@ -361,7 +360,6 @@ int instance_control_start(void) {
     g_control_running = 0;
     return -1;
   }
-  g_control_thread_started = 1;
   if (write_identity() != 0) {
     instance_control_stop();
     return -1;
@@ -380,7 +378,6 @@ void instance_control_stop(void) {
   }
   /* The listener is closed and the thread is detached: it either observes the
    * flag or is torn down with the process image. */
-  g_control_thread_started = 0;
 }
 
 #else
