@@ -213,7 +213,7 @@ To make these persistent, add them to `/etc/sysctl.conf`.
 - Launch after the system is fully booted and the loader is ready. The on-screen notification will display the IP and port.
 - For maximum throughput: direct cable from console to PC, static IPs, no router in between.
 - Avoid initiating transfers while background downloads or system updates are active — the network stack is shared.
-- If you see **"payload already loaded"**: a previous instance is still active. `zftpd` will attempt to terminate it and restart on the default port. If that fails, it tries up to 9 subsequent ports (`FTP_DEFAULT_PORT+1` … `+9`).
+- If you see **"payload already loaded"**: a previous instance is still active. The new payload asks it to shut down on its control port (`127.0.0.1:28888`) and the previous instance runs its own teardown even when its threads are blocked, so it always releases the FTP, HTTP and MCP ports. Instances that predate the control port — or one wedged after accepting it — are identified by thread name and stopped, never signalling the loader's process group. If a payload still holds the console, the new instance stops instead of binding ports another instance owns.
 
 </details>
 
@@ -301,7 +301,7 @@ Output artifacts are versioned and platform-tagged, placed in `build/<target>/<b
 | Compiler | C11 — `gcc` or `clang` |
 | Build system | `make` |
 | `.bin` generation | `objcopy` (binutils or llvm-objcopy); PS4: `orbis-objcopy`; PS5: `prospero-objcopy` |
-| PS4 | `PS4_PAYLOAD_SDK` set in environment |
+| PS4 | `PS4_PAYLOAD_SDK` set in environment; zhttp builds with downloads use the PacBrew PS4 portlibs, installed by `tools/fetch_pacbrew_ps4.sh` |
 | PS5 | `PS5_PAYLOAD_SDK` set in environment; zhttp builds require the PacBrew SDK bundle with libcurl + libnfs |
 
 ### Commands
@@ -323,12 +323,53 @@ make TARGET=linux test
 make TARGET=macos test
 ```
 
-### PS5 web downloads
+### Console web downloads
 
-PS5 zhttp builds use the maintained PacBrew ports of **libcurl** and **libnfs**.
-The downloader supports HTTP/HTTPS/FTP/FTPS and `nfs://` NAS sources; HTTPS
-certificate verification stays enabled and the PacBrew Mozilla CA bundle is
-embedded into the payload at build time. See [`docs/dependencies.md`](docs/dependencies.md).
+PS4 and PS5 zhttp builds use the maintained PacBrew ports of **libcurl**
+(PS5 also **libnfs**). The downloader supports HTTP/HTTPS/FTP/FTPS and
+`nfs://` NAS sources; HTTPS certificate verification stays enabled and the
+PacBrew Mozilla CA bundle is embedded into the payload at build time.
+See [`docs/dependencies.md`](docs/dependencies.md).
+
+PS5 zhttp releases also accept `magnet:?` links. They use a native
+libtorrent-rasterbar engine inside the payload; no companion computer is
+required. For local PS5 builds, install a PS5 SDK, then run
+`bash tools/build_ps5_libtorrent.sh "$PS5_PAYLOAD_SDK"` followed by
+`make TARGET=ps5 ENABLE_LIBTORRENT=1 clean all`. The release workflow builds this
+dependency automatically.
+
+PS5 extracts ZIP archives with its built-in reader. To enable other formats
+supported by libarchive, install PacBrew `ps5-payload-libarchive` in the PS5
+SDK and build with `make TARGET=ps5 ENABLE_LIBARCHIVE=1`. ZIP files continue
+to use the built-in reader in that build.
+
+PS4 builds detect the PacBrew package through the target toolchain only
+(`orbis-pkg-config` / `orbis-curl-config` inside `PS4_PAYLOAD_SDK`, or the
+`OPENORBIS` environment), never through the host's libcurl. When the package
+is missing the downloader is disabled at build time and the rest of zftpd is
+unaffected; the same behaviour is available explicitly with
+`ENABLE_LIBCURL=0`. Override `PS4_PKG_CONFIG`, `PS4_CURL_CONFIG` and
+`PS4_CA_BUNDLE` to point at a custom install.
+
+#### Download queue and resume
+
+Links pasted into the Transfers view line up in a FIFO queue: `TRANSFER_MAX_CONCURRENT`
+downloads run at a time (2 by default, override at build time with
+`-DTRANSFER_MAX_CONCURRENT=<n>`) and the rest wait, showing their position.
+Queued jobs can be held back or cancelled before they ever start; up to
+`TRANSFER_MAX_ACTIVE` (16) jobs are tracked.
+
+HTTP/FTP/NFS downloads write to `<name>.zftpd.part` and rename it after
+`fsync()`. Magnet downloads write a `<name>.zftpd.part` directory containing
+the torrent files; the directory is renamed after every piece is verified.
+Download status, destination and progress are recorded
+atomically in `/data/zftpd/transfers.state` (falling back to `/tmp/zftpd/`).
+BitTorrent resume data is stored alongside that state file. On startup zftpd
+restores the visible list and resumes unfinished jobs from the bytes already
+on disk. Paused jobs stay paused, and failed
+jobs remain visible for retry. The Transfers view can delete a saved partial
+and its record, or use Start over to delete it and start the same link from
+zero. Removing a completed record leaves the completed file untouched.
 
 ### Artifacts
 
@@ -400,6 +441,12 @@ Upload support is enabled automatically alongside ZHTTP (`ENABLE_WEB_UPLOAD=1`).
 After console Rest Mode, ZHTTP auto-reconnects via `/api/status` (see [docs/restmode.md](docs/restmode.md)).
 
 Custom console toasts are available via `GET /api/notify?text=Hello` (useful for Home Assistant and similar local automation — see [docs/API.md](docs/API.md)).
+
+The System view also drives the hardware: fan threshold, network-listener restart and **Blu-ray eject** (`POST /api/system/eject`, hidden on Digital Edition consoles). The eject path comes from [BD-EJ](https://github.com/seregonwar/BD-EJ).
+
+Downloads and previews send the raw file bytes. Console **SELF containers** can be requested decrypted instead, exactly like the FTP path does: enable *Settings → Downloads → Decrypt protected files* (or pass `?decrypt=1` to `/api/file/get`). The kernel pager is swapped in for that transfer only, so every other file — and every other client — keeps getting the on-disk bytes untouched.
+
+Selecting many items (folders included) offers **Download as ZIP**: the archive is built *while* it streams (`/api/archive/zip`), so nothing is written to the console and even multi-gigabyte selections need no free space.
 
 ---
 

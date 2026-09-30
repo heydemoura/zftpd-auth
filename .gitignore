@@ -56,6 +56,7 @@ dkms.conf
 .DS_Store
 /external/ps4-payload-sdk
 /external/ps5-payload-sdk
+/external/pacbrew
 /external/ftpsrv-master
 /build
 /external/ps3libraries-master
@@ -97,3 +98,4 @@ race
 log.txt
 /git-patch
 *.bak
+/.commandcode

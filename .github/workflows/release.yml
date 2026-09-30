@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create/update, for example v1.5.0"
+        description: "Release tag to create/update, for example v1.6.0"
         required: false
         type: string
       draft:
@@ -116,6 +116,13 @@ jobs:
           test -x "$sdk_dst/bin/orbis-clang"
           echo "PS4_PAYLOAD_SDK=$sdk_dst" >> "$GITHUB_ENV"
 
+      - name: Install PacBrew PS4 portlibs (libcurl)
+        if: matrix.platform == 'ps4' && matrix.zhttpd == '1'
+        run: |
+          set -euo pipefail
+          bash tools/fetch_pacbrew_ps4.sh "$GITHUB_WORKSPACE/pacbrew-ps4-openorbis"
+          echo "PS4_PACBREW_ROOT=$GITHUB_WORKSPACE/pacbrew-ps4-openorbis" >> "$GITHUB_ENV"
+
       - name: Install PS5 PacBrew SDK bundle
         if: matrix.platform == 'ps5'
         run: |
@@ -139,6 +146,13 @@ jobs:
           test -f "$sdk_dst/target/user/homebrew/etc/ca-bundle.crt"
           echo "PS5_PAYLOAD_SDK=$sdk_dst" >> "$GITHUB_ENV"
 
+      - name: Build PS5 BitTorrent engine
+        if: matrix.platform == 'ps5' && matrix.zhttpd == '1'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y libboost-dev
+          bash tools/build_ps5_libtorrent.sh "$PS5_PAYLOAD_SDK"
+
       - name: Build release variant
         run: |
           set -euo pipefail
@@ -159,6 +173,7 @@ jobs:
               ENABLE_ZHTTPD="${{ matrix.zhttpd }}" \
               ENABLE_MCP=0 \
               ENABLE_PKG_INSTALL=0 \
+              ENABLE_LIBTORRENT="${{ matrix.zhttpd }}" \
               clean all
           else
             make \

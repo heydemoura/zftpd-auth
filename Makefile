@@ -67,7 +67,9 @@ ifeq ($(TARGET),ps4)
     export LLVM_CONFIG := $(ORBIS_LLVM_CONFIG)
     include $(PS4_PAYLOAD_SDK)/toolchain/orbis.mk
     PLATFORM_DEFS := -DPLATFORM_PS4 -DPS4
-    PLATFORM_LIBS := -lkernel -lpthread -lSceSysmodule -lSceSystemService -lSceUserService
+    # SceSysmodule is loaded at runtime with dlopen: the payload SDK does not
+    # ship a linkable library for it.
+    PLATFORM_LIBS := -lkernel -lpthread -lSceSystemService -lSceUserService
     PLATFORM_LDFLAGS :=
 endif
 
@@ -109,6 +111,7 @@ endif
 
 # Default to GCC if no target matched
 CC ?= gcc
+CXX ?= c++
 PLATFORM_LIBS ?= -lpthread
 
 # Event loop implementation — kqueue for BSD/macOS/PS4/PS5, epoll for Linux
@@ -196,7 +199,11 @@ CFLAGS += -I./include/platform/ps5 -I./include/archive -I./include/runtime
 # LINKER FLAGS
 #============================================================================
 
-ifeq ($(HOST_OS),Linux)
+# Console payloads are loaded by loaders (GoldHEN binloader, elfldr) that
+# expect a position-independent executable, no matter which host built them.
+ifneq ($(filter $(TARGET),ps4 ps5),)
+    LDFLAGS += -pie
+else ifeq ($(HOST_OS),Linux)
     LDFLAGS += -pie
 endif
 LDFLAGS += $(PLATFORM_LDFLAGS)
@@ -216,6 +223,9 @@ SOURCES += src/platform/fileio/directory.c
 SOURCES += src/platform/pal_alloc.c
 SOURCES += src/platform/pal_scratch.c
 SOURCES += src/platform/pal_notification.c
+SOURCES += src/platform/pal_disc.c
+SOURCES += src/platform/pal_volume.c
+SOURCES += src/platform/pal_dns_filter.c
 SOURCES += src/platform/pal_filesystem.c
 SOURCES += src/platform/pal_filesystem_psx.c
 SOURCES += src/ftp/ftp_path.c
@@ -234,12 +244,21 @@ SOURCES += src/ftp/ftp_buffer_pool.c
 SOURCES += src/ftp/ftp_log.c
 SOURCES += src/ftp/ftp_crypto.c
 SOURCES += src/app/main.c
+SOURCES += src/app/instance_control.c
 SOURCES += src/platform/pal_resilient_server.c
 SOURCES += src/ftp/ftp_instance.c
 
-# PS5-specific modules
+# PS5 kernel syscall hook is opt-in until its firmware-specific install path
+# has been validated on real hardware. The normal payload never loads it.
+ENABLE_PS5_NET_FILTER ?= 0
 ifeq ($(TARGET),ps5)
+    CFLAGS += -DENABLE_PS5_NET_FILTER=$(ENABLE_PS5_NET_FILTER)
+endif
+ifeq ($(TARGET),ps5)
+SOURCES += src/platform/ps5/ps5_fw_offsets.c
+ifeq ($(ENABLE_PS5_NET_FILTER),1)
 SOURCES += src/platform/ps5/ps5_net_filter.c
+endif
 endif
 
 #============================================================================
@@ -282,13 +301,27 @@ STRIP ?= strip
 ifeq ($(ENABLE_ZHTTPD),1)
     CFLAGS += -DENABLE_ZHTTPD=1
     CFLAGS += -DENABLE_WEB_UPLOAD=1
-    ENABLE_PKG_INSTALL ?= 0
+    # PKG installation rides along with the web interface; override with =0.
+    ENABLE_PKG_INSTALL ?= 1
     CFLAGS += -DENABLE_PKG_INSTALL=$(ENABLE_PKG_INSTALL)
+    ifeq ($(TARGET),ps5)
+        # The system installer cannot be driven from a payload process, so a
+        # small helper program is embedded here and delivered at runtime.
+        INSTALL_HELPER_ELF := $(BUILD_DIR)/install_helper.elf
+        INSTALL_HELPER_BLOB := $(BUILD_DIR)/generated/install_helper_blob.c
+        SOURCES += $(INSTALL_HELPER_BLOB)
+        SOURCES += src/http/games/ps5_install_helper.c
+        CFLAGS += -DZFTPD_INSTALL_HELPER=1
+    endif
     ENABLE_LIBCURL ?= 1
     SOURCES += $(EVENT_LOOP_SRC)
     SOURCES += src/http/http_server.c
+    SOURCES += src/http/http_listener.c
+    SOURCES += src/http/http_upload.c
     SOURCES += src/http/http_parser.c
     SOURCES += src/http/http_response.c
+    SOURCES += src/http/http_response_stream.c
+    SOURCES += src/http/http_json.c
     SOURCES += src/http/http_api.c
     SOURCES += src/http/http_api_common.c
     SOURCES += src/http/http_api_files.c
@@ -297,6 +330,7 @@ ifeq ($(ENABLE_ZHTTPD),1)
     SOURCES += src/http/http_api_transfer.c
     SOURCES += src/http/http_static.c
     SOURCES += src/http/http_api_archive.c
+    SOURCES += src/http/http_api_dump.c
     SOURCES += src/http/http_csrf.c
     WEB_RESOURCE_FILES := $(shell find web -path web/legacy -prune -o -type f -print | sort)
     HTTP_RESOURCES_C := $(BUILD_DIR)/generated/http/http_resources.c
@@ -304,7 +338,11 @@ ifeq ($(ENABLE_ZHTTPD),1)
     SOURCES += src/archive/exfat_unpacker.c
     SOURCES += src/archive/pkg_unpacker.c
     SOURCES += src/archive/builtin_unzip.c
+SOURCES += src/archive/zip_writer.c
+    SOURCES += src/archive/archive_path.c
     SOURCES += src/transfer/transfer_manager.c
+    SOURCES += src/transfer/transfer_state.c
+    SOURCES += src/transfer/dump_job.c
 endif
 
 # NFS URL transfers are enabled by default for PS5 zhttp builds. Other targets
@@ -362,41 +400,48 @@ endif
 # so we fall back to a simple file-existence check on bundled headers.
 #============================================================================
 
-# ── libarchive: auto-detect on desktop, opt-in on consoles ───────────────
+# ── libarchive: zhttp only; auto-detect on desktop ─────────────────────
 override ENABLE_LIBCURL ?= 0
-ifneq ($(filter $(TARGET),ps4 ps5),)
-  # PS4/PS5: no prebuilt static lib — explicit opt-in only (override ENABLE_LIBARCHIVE=1)
+ifeq ($(ENABLE_ZHTTPD),1)
+ifeq ($(TARGET),ps5)
+  # Optional PacBrew library for non-ZIP formats; ZIP keeps the builtin reader.
   override ENABLE_LIBARCHIVE ?= 0
   ifeq ($(ENABLE_LIBARCHIVE),1)
-    $(info [INFO] libarchive not supported on cross-compile targets — disabling)
-    override ENABLE_LIBARCHIVE := 0
+    PS5_PKG_CONFIG ?= $(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config
+    _HAS_PS5_ARCHIVE := $(shell test -x $(PS5_PKG_CONFIG) && $(PS5_PKG_CONFIG) --exists libarchive && echo 1 || echo 0)
+    ifneq ($(_HAS_PS5_ARCHIVE),1)
+      $(error PS5 archive extraction requires PacBrew ps5-payload-libarchive)
+    endif
+    CFLAGS += -DENABLE_LIBARCHIVE=1 $(shell $(PS5_PKG_CONFIG) --cflags libarchive)
+    LIBS += $(shell $(PS5_PKG_CONFIG) --static --libs libarchive)
+    $(info [INFO] PS5 archive extraction: PacBrew libarchive)
   endif
+else ifeq ($(TARGET),ps4)
+  # PS4 builds use the builtin ZIP backend.
+  override ENABLE_LIBARCHIVE := 0
 else
   # Desktop (macOS/Linux): auto-detect unless user explicitly set it to 0
   ifneq ($(ENABLE_LIBARCHIVE),0)
     _HAS_ARCHIVE := 0
-    # 1) System headers
+    # 1) System installation
     _SYS_ARCHIVE := $(shell echo '\#include <archive.h>' | $(CC) -xc -fsyntax-only - 2>/dev/null && echo 1 || echo 0)
     ifeq ($(_SYS_ARCHIVE),1)
       _HAS_ARCHIVE := 1
-      $(info [INFO] libarchive: using system headers)
+      LIBS += -larchive
+      $(info [INFO] libarchive: using system installation)
     endif
-    # 2) macOS Homebrew (Apple Silicon, then Intel)
+    # 2) Homebrew keg (libarchive is keg-only on macOS)
     ifeq ($(_HAS_ARCHIVE),0)
       ifeq ($(HOST_OS),Darwin)
-        _HB_ARCHIVE := $(shell echo '\#include <archive.h>' | $(CC) -xc -fsyntax-only -I/opt/homebrew/include - 2>/dev/null && echo 1 || echo 0)
-        ifeq ($(_HB_ARCHIVE),1)
-          _HAS_ARCHIVE := 1
-          CFLAGS += -I/opt/homebrew/include
-          LDFLAGS += -L/opt/homebrew/lib
-          $(info [INFO] libarchive: using Homebrew (Apple Silicon) — /opt/homebrew)
-        else
-          _HB_ARCHIVE := $(shell echo '\#include <archive.h>' | $(CC) -xc -fsyntax-only -I/usr/local/include - 2>/dev/null && echo 1 || echo 0)
+        _BREW_ARCHIVE_PREFIX := $(shell brew --prefix libarchive 2>/dev/null)
+        ifneq ($(_BREW_ARCHIVE_PREFIX),)
+          _HB_ARCHIVE := $(shell echo '\#include <archive.h>' | $(CC) -xc -fsyntax-only -I$(_BREW_ARCHIVE_PREFIX)/include - 2>/dev/null && echo 1 || echo 0)
           ifeq ($(_HB_ARCHIVE),1)
             _HAS_ARCHIVE := 1
-            CFLAGS += -I/usr/local/include
-            LDFLAGS += -L/usr/local/lib
-            $(info [INFO] libarchive: using Homebrew (Intel) — /usr/local)
+            CFLAGS += -I$(_BREW_ARCHIVE_PREFIX)/include
+            LDFLAGS += -L$(_BREW_ARCHIVE_PREFIX)/lib
+            LIBS += -larchive
+            $(info [INFO] libarchive: using Homebrew keg $(_BREW_ARCHIVE_PREFIX))
           endif
         endif
       endif
@@ -425,6 +470,9 @@ else
     endif
   endif
 endif
+else
+  override ENABLE_LIBARCHIVE := 0
+endif
 
 # ── libcurl detection ─────────────────────────────────────────────────────
 # zftpd deliberately uses external libcurl instead of maintaining an HTTP/TLS
@@ -444,16 +492,67 @@ ifeq ($(ENABLE_LIBCURL),1)
     endif
     GENERATED_CA_HEADER := $(BUILD_DIR)/generated/zftpd_ca_bundle.h
     CFLAGS += -DZFTPD_EMBEDDED_CA_BUNDLE=1 -I$(BUILD_DIR)/generated
+    CURL_CA_BUNDLE_SRC := $(PS5_CA_BUNDLE)
     $(info [INFO] URL downloads: external PacBrew libcurl + embedded CA bundle)
   else ifeq ($(TARGET),ps4)
-    PS4_CURL_CONFIG ?= $(shell command -v orbis-curl-config 2>/dev/null || true)
-    ifeq ($(strip $(PS4_CURL_CONFIG)),)
+    # PacBrew ps4-openorbis portlibs (libcurl + mbedTLS + zlib) as unpacked by
+    # tools/fetch_pacbrew_ps4.sh.  Only the headers and the static libraries
+    # are used: the curl wrapper the package ships emits the OpenOrbis
+    # toolchain's own link flags, which do not belong in a payload-SDK link.
+    PS4_PACBREW_ROOT ?= $(shell for d in $(abspath external/pacbrew/ps4/openorbis) /opt/pacbrew/ps4/openorbis; do [ -f "$$d/usr/lib/libcurl.a" ] && { printf '%s' "$$d"; break; }; done)
+
+    ifneq ($(strip $(PS4_PACBREW_ROOT)),)
+      # The OpenOrbis build reaches errno through musl's __errno_location()
+      # and uses fnmatch()/execl(); the payload libc has none of them.
+      SOURCES += src/platform/ps4/ps4_pacbrew_compat.c
+      CFLAGS += -DENABLE_LIBCURL=1 -DCURL_STATICLIB -I$(PS4_PACBREW_ROOT)/usr/include
+      LIBS += -L$(PS4_PACBREW_ROOT)/usr/lib -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lSceNet
+      # Same trust-store contract as PS5: HTTPS verification must not degrade
+      # silently, so the Mozilla bundle is embedded at build time.
+      PS4_CA_BUNDLE ?= $(PS4_PACBREW_ROOT)/usr/etc/ca-bundle.crt
+      ifeq ($(wildcard $(PS4_CA_BUNDLE)),)
+        $(error PS4 libcurl CA bundle not found: $(PS4_CA_BUNDLE) — re-run tools/fetch_pacbrew_ps4.sh or set PS4_CA_BUNDLE=<path>)
+      endif
+      GENERATED_CA_HEADER := $(BUILD_DIR)/generated/zftpd_ca_bundle.h
+      CFLAGS += -DZFTPD_EMBEDDED_CA_BUNDLE=1 -I$(BUILD_DIR)/generated
+      CURL_CA_BUNDLE_SRC := $(PS4_CA_BUNDLE)
+      $(info [INFO] URL downloads: PacBrew PS4 portlibs ($(PS4_PACBREW_ROOT)) + embedded CA bundle)
+    else
+    # A toolchain-provided pkg-config entry (or curl-config) still works.
+    # Probe the target environment only — a host libcurl would link code built
+    # for the wrong OS.
+    PS4_PKG_CONFIG ?= $(shell for c in $(PS4_PAYLOAD_SDK)/bin/orbis-pkg-config $(PS4_PAYLOAD_SDK)/bin/openorbis-pkg-config $(OPENORBIS)/bin/openorbis-pkg-config; do [ -x "$$c" ] && { printf '%s' "$$c"; break; }; done)
+    PS4_CURL_CONFIG ?= $(shell for c in $(PS4_PAYLOAD_SDK)/bin/orbis-curl-config $(PS4_PAYLOAD_SDK)/bin/curl-config $(PS4_PAYLOAD_SDK)/bin/openorbis-curl-config; do [ -x "$$c" ] && { printf '%s' "$$c"; break; }; done)
+
+    _HAS_PS4_CURL := $(shell if [ -n "$(strip $(PS4_PKG_CONFIG))" ] && $(PS4_PKG_CONFIG) --exists libcurl >/dev/null 2>&1; then echo 1; elif [ -n "$(strip $(PS4_CURL_CONFIG))" ]; then echo 1; fi)
+
+    ifneq ($(_HAS_PS4_CURL),1)
       $(info [INFO] PS4 external libcurl not found — URL downloader disabled)
+      $(info [INFO]   run tools/fetch_pacbrew_ps4.sh to install PacBrew ps4-openorbis-portlibs)
+      $(info [INFO]   or point PS4_PKG_CONFIG / PS4_CURL_CONFIG at a target config tool)
       override ENABLE_LIBCURL := 0
     else
-      CFLAGS += -DENABLE_LIBCURL=1 $(shell $(PS4_CURL_CONFIG) --cflags)
-      LIBS += $(shell $(PS4_CURL_CONFIG) --static-libs)
-      $(info [INFO] URL downloads: external PS4 libcurl)
+      ifneq ($(strip $(PS4_PKG_CONFIG)),)
+        PS4_CURL_CFLAGS := $(shell $(PS4_PKG_CONFIG) --cflags libcurl)
+        PS4_CURL_LIBS := $(shell $(PS4_PKG_CONFIG) --static --libs libcurl)
+      else
+        PS4_CURL_CFLAGS := $(shell $(PS4_CURL_CONFIG) --cflags)
+        PS4_CURL_LIBS := $(shell $(PS4_CURL_CONFIG) --static-libs)
+      endif
+      CFLAGS += -DENABLE_LIBCURL=1 $(PS4_CURL_CFLAGS)
+      LIBS += $(PS4_CURL_LIBS)
+
+      # Same trust-store contract as PS5: the PacBrew curl package ships the
+      # Mozilla bundle, and HTTPS verification must not degrade silently.
+      PS4_CA_BUNDLE ?= $(PS4_PAYLOAD_SDK)/target/user/homebrew/etc/ca-bundle.crt
+      ifeq ($(wildcard $(PS4_CA_BUNDLE)),)
+        $(error PS4 libcurl CA bundle not found: $(PS4_CA_BUNDLE) — override with PS4_CA_BUNDLE=<path>)
+      endif
+      GENERATED_CA_HEADER := $(BUILD_DIR)/generated/zftpd_ca_bundle.h
+      CFLAGS += -DZFTPD_EMBEDDED_CA_BUNDLE=1 -I$(BUILD_DIR)/generated
+      CURL_CA_BUNDLE_SRC := $(PS4_CA_BUNDLE)
+      $(info [INFO] URL downloads: PacBrew PS4 libcurl + embedded CA bundle)
+    endif
     endif
   else
     _HAS_CURL := $(shell echo '\#include <curl/curl.h>' | $(CC) -xc -fsyntax-only - 2>/dev/null && echo 1 || echo 0)
@@ -469,6 +568,44 @@ endif
 
 ifeq ($(ENABLE_LIBCURL),1)
   SOURCES += src/transfer/backend_curl.c
+endif
+
+# Native BitTorrent engine for magnet links. PS5 needs a libtorrent-rasterbar
+# port installed into its payload SDK; host libraries must never be linked
+# into a console payload.
+ENABLE_LIBTORRENT ?= 0
+ifeq ($(ENABLE_LIBTORRENT),1)
+  ifeq ($(TARGET),ps5)
+    PS5_PKG_CONFIG ?= $(PS5_PAYLOAD_SDK)/bin/prospero-pkg-config
+    ifneq ($(shell test -x $(PS5_PKG_CONFIG) && $(PS5_PKG_CONFIG) --exists libtorrent-rasterbar && echo 1),1)
+      $(error PS5 magnet downloads require a PS5 libtorrent-rasterbar port in the payload SDK)
+    endif
+    TORRENT_CFLAGS := $(shell $(PS5_PKG_CONFIG) --cflags libtorrent-rasterbar)
+    TORRENT_LIBS := $(shell $(PS5_PKG_CONFIG) --static --libs libtorrent-rasterbar)
+  else
+    ifneq ($(shell pkg-config --exists libtorrent-rasterbar 2>/dev/null && echo 1),1)
+      $(error ENABLE_LIBTORRENT=1 requires libtorrent-rasterbar development files)
+    endif
+    TORRENT_CFLAGS := $(shell pkg-config --cflags libtorrent-rasterbar)
+    TORRENT_LIBS := $(shell pkg-config --libs libtorrent-rasterbar)
+    ifeq ($(HOST_OS),Darwin)
+      TORRENT_BOOST_PREFIX := $(shell brew --prefix boost 2>/dev/null)
+      TORRENT_CFLAGS += -I$(TORRENT_BOOST_PREFIX)/include
+      TORRENT_OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null)
+      TORRENT_CFLAGS += -I$(TORRENT_OPENSSL_PREFIX)/include
+    endif
+  endif
+  CFLAGS += -DENABLE_LIBTORRENT=1
+  TORRENT_CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -Werror -O2 -fPIE \
+    $(PLATFORM_DEFS) -I./include $(TORRENT_CFLAGS)
+  ifeq ($(TARGET),ps5)
+    TORRENT_CXXFLAGS += -fvisibility=hidden -fno-inline-functions
+  endif
+  LIBS += $(TORRENT_LIBS)
+  TORRENT_OBJECT := $(OBJ_DIR)/transfer/backend_torrent.o
+  CXX_LINK := $(CXX)
+else
+  CXX_LINK := $(CC)
 endif
 
 # ── libnfs detection ──────────────────────────────────────────────────────
@@ -496,6 +633,7 @@ endif
 OBJECTS := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(filter src/%.c,$(SOURCES)))
 OBJECTS += $(patsubst mcp/src/%.c,$(OBJ_DIR)/mcp/%.o,$(filter mcp/src/%.c,$(SOURCES)))
 OBJECTS += $(patsubst $(BUILD_DIR)/generated/%.c,$(OBJ_DIR)/generated/%.o,$(filter $(BUILD_DIR)/generated/%.c,$(SOURCES)))
+OBJECTS += $(TORRENT_OBJECT)
 
 # FFI Object files
 FFI_SOURCES := ffi/c_core/pal_ffi.c
@@ -612,7 +750,7 @@ $(PROJECT): all
 $(OUTPUT_ELF): $(OBJECTS) | $(BIN_DIR)
 	@echo "  [LD]  $@"
 	@mkdir -p $(BIN_DIR)
-	@$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+	@$(CXX_LINK) $(LDFLAGS) -o $@ $^ $(LIBS)
 	@echo "Build complete: $(PROJECT) ($(TARGET), $(BUILD_TYPE))"
 
 # FFI Build Targets
@@ -638,7 +776,7 @@ endif
 $(FFI_OUTPUT): $(LIB_OBJECTS) $(FFI_OBJECTS) | $(BIN_DIR)
 	@echo "  [LD]  $@ (Shared Library)"
 	@mkdir -p $(BIN_DIR)
-	@$(CC) $(LDFLAGS) $(FFI_LDFLAGS) -fPIC -o $@ $(LIB_OBJECTS) $(FFI_OBJECTS) $(LIBS)
+	@$(CXX_LINK) $(LDFLAGS) $(FFI_LDFLAGS) -fPIC -o $@ $(LIB_OBJECTS) $(FFI_OBJECTS) $(LIBS)
 	@echo "FFI C-Core built: $@"
 
 # Build all supported platforms (best-effort: includes only toolchains found on the host).
@@ -735,18 +873,21 @@ debug-all:
 		echo "==> Building $$t (debug)"; \
 		$(MAKE) TARGET=$$t BUILD_TYPE=debug clean all; \
 	done
-# Generate the PS5 trust store from PacBrew's Mozilla CA bundle.
-ifeq ($(TARGET),ps5)
-ifeq ($(ENABLE_LIBCURL),1)
+# Generate the embedded trust store from PacBrew's Mozilla CA bundle (PS4/PS5).
+ifneq ($(strip $(CURL_CA_BUNDLE_SRC)),)
 $(OBJ_DIR)/transfer/backend_curl.o: $(GENERATED_CA_HEADER)
 
-$(GENERATED_CA_HEADER): $(PS5_CA_BUNDLE) tools/embed_binary.py
+$(GENERATED_CA_HEADER): $(CURL_CA_BUNDLE_SRC) tools/embed_binary.py
 	@echo "  [GEN] $@"
 	@python3 tools/embed_binary.py $< $@ zftpd_ca_bundle
 endif
-endif
 
 # Compile C source files
+$(OBJ_DIR)/transfer/backend_torrent.o: src/transfer/backend_torrent.cpp | $(OBJ_DIR) $(DEP_DIR)
+	@echo "  [CXX] $<"
+	@mkdir -p $(dir $@) $(dir $(DEP_DIR)/transfer/backend_torrent.d)
+	@$(CXX) $(TORRENT_CXXFLAGS) -MMD -MP -MF $(DEP_DIR)/transfer/backend_torrent.d -MT $@ -c $< -o $@
+
 $(OBJ_DIR)/%.o: src/%.c | $(OBJ_DIR) $(DEP_DIR)
 	@echo "  [CC]  $<"
 	@mkdir -p $(dir $@) $(dir $(DEP_DIR)/$*.d)
@@ -821,13 +962,31 @@ TEST_BINS += $(BUILD_DIR)/tests/test_copy_atomic
 TEST_BINS += $(BUILD_DIR)/tests/test_ftp_commands
 TEST_BINS += $(BUILD_DIR)/tests/test_fileio_tree
 TEST_BINS += $(BUILD_DIR)/tests/test_fileio_basic
+TEST_BINS += $(BUILD_DIR)/tests/test_ps5_fw_offsets
 ifeq ($(ENABLE_ZHTTPD),1)
 TEST_BINS += $(BUILD_DIR)/tests/test_transfer
+TEST_BINS += $(BUILD_DIR)/tests/test_transfer_parallel
+TEST_BINS += $(BUILD_DIR)/tests/test_transfer_state
+TEST_BINS += $(BUILD_DIR)/tests/test_transfer_queue
+TEST_BINS += $(BUILD_DIR)/tests/test_transfer_orphans
+ifeq ($(ENABLE_LIBTORRENT),1)
+TEST_BINS += $(BUILD_DIR)/tests/test_transfer_torrent
+endif
+TEST_BINS += $(BUILD_DIR)/tests/test_http_parser
+TEST_BINS += $(BUILD_DIR)/tests/test_http_upload
+TEST_BINS += $(BUILD_DIR)/tests/test_http_server
+TEST_BINS += $(BUILD_DIR)/tests/test_http_response_stream
 TEST_BINS += $(BUILD_DIR)/tests/test_http_api_common
 TEST_BINS += $(BUILD_DIR)/tests/test_http_files
 TEST_BINS += $(BUILD_DIR)/tests/test_http_process
 TEST_BINS += $(BUILD_DIR)/tests/test_http_system
 TEST_BINS += $(BUILD_DIR)/tests/test_http_games
+TEST_BINS += $(BUILD_DIR)/tests/test_archive_path
+TEST_BINS += $(BUILD_DIR)/tests/test_builtin_unzip
+TEST_BINS += $(BUILD_DIR)/tests/test_zip_writer
+TEST_BINS += $(BUILD_DIR)/tests/test_pal_volume
+TEST_BINS += $(BUILD_DIR)/tests/test_http_archive
+TEST_BINS += $(BUILD_DIR)/tests/test_dump_job
 endif
 
 ifeq ($(filter $(TARGET),linux macos),)
@@ -836,16 +995,20 @@ test: $(OUTPUT_BIN)
 else
 test: $(OUTPUT_ELF) $(TEST_BINS)
 	@echo "Running tests..."
-	@for t in $(TEST_BINS); do ./$$t; done
+	@set -e; for t in $(TEST_BINS); do ./$$t; done
 endif
 
 $(BUILD_DIR)/tests/test_http_query: tests/test_http_query.c $(LIB_OBJECTS) | $(BUILD_DIR)/tests
 	@echo "  [CC]  $<"
-	@$(CC) $(CFLAGS) -DFTP_AUTH_DELAY=0 -DFTP_PORT_ALLOW_FOREIGN_IP=1 -o $@ $< $(LIB_OBJECTS) $(LDFLAGS) $(LIBS)
+	@$(CXX_LINK) $(CFLAGS) -DFTP_AUTH_DELAY=0 -DFTP_PORT_ALLOW_FOREIGN_IP=1 -o $@ -x c $< -x none $(LIB_OBJECTS) $(LDFLAGS) $(LIBS)
+
+$(BUILD_DIR)/tests/test_transfer_torrent: tests/test_transfer_torrent.cpp $(TORRENT_OBJECT) | $(BUILD_DIR)/tests
+	@echo "  [CXX] $<"
+	@$(CXX) $(TORRENT_CXXFLAGS) -o $@ $< $(TORRENT_OBJECT) $(LDFLAGS) $(TORRENT_LIBS) -lpthread
 
 $(BUILD_DIR)/tests/%: tests/%.c $(LIB_OBJECTS) | $(BUILD_DIR)/tests
 	@echo "  [CC]  $<"
-	@$(CC) $(CFLAGS) -DFTP_AUTH_DELAY=0 -DFTP_PORT_ALLOW_FOREIGN_IP=1 -o $@ $< $(LIB_OBJECTS) $(LDFLAGS) $(LIBS)
+	@$(CXX_LINK) $(CFLAGS) -DFTP_AUTH_DELAY=0 -DFTP_PORT_ALLOW_FOREIGN_IP=1 -o $@ -x c $< -x none $(LIB_OBJECTS) $(LDFLAGS) $(LIBS)
 
 bin: $(OUTPUT_BIN)
 
@@ -972,3 +1135,44 @@ web-deploy:
 	@echo "  [WEB]  web-deploy is deprecated — web UI is now embedded in the binary"
 	@echo "  [WEB]  Resources are generated automatically under build/.../generated"
 	@echo "  [WEB]  Done — $(shell find web -path web/legacy -prune -o \( -name '*.css' -o -name '*.js' \) -print | wc -l | tr -d ' ') files deployed"
+
+#============================================================================
+# Flag changes must invalidate object files.
+#
+# Objects do not record the flags they were built with, so toggling a feature
+# (ENABLE_LIBTORRENT, ENABLE_PKG_INSTALL, ...) used to relink stale objects and
+# fail with undefined symbols.  The stamp is rewritten only when the flags
+# actually change, and every object depends on it, so a real change rebuilds.
+#============================================================================
+
+FLAG_STAMP := $(OBJ_DIR)/.build-flags
+
+.PHONY: FORCE
+FORCE:
+
+$(FLAG_STAMP): FORCE
+	@mkdir -p $(OBJ_DIR)
+	@printf '%s\n' '$(CFLAGS)' '$(LDFLAGS)' '$(LIBS)' > $@.tmp
+	@if ! cmp -s $@.tmp $@; then \
+		echo "  [FLAGS]    build flags changed — objects will be rebuilt"; \
+		mv -f $@.tmp $@; \
+	fi
+	@rm -f $@.tmp
+
+$(OBJECTS) $(LIB_OBJECTS): $(FLAG_STAMP)
+
+#============================================================================
+# PS5 installer helper
+#============================================================================
+
+ifneq ($(INSTALL_HELPER_ELF),)
+$(INSTALL_HELPER_ELF): src/platform/ps5/install_helper/install_helper.c | $(BIN_DIR)
+	@echo "  [CC]  $<"
+	@$(CXX_LINK) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LIBS)
+
+$(INSTALL_HELPER_BLOB): $(INSTALL_HELPER_ELF) tools/gen_blob.py
+	@mkdir -p $(dir $@)
+	@python3 tools/gen_blob.py $< install_helper_elf $@
+
+$(OBJ_DIR)/generated/install_helper_blob.o: $(INSTALL_HELPER_BLOB)
+endif
