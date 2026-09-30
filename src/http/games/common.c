@@ -1,5 +1,6 @@
 #include "games_internal.h"
 #include "ftp_config.h"
+#include "pkg_unpacker.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,6 +184,84 @@ int games_read_file(const char *path, uint8_t **out_data,
   return 0;
 }
 
+/** Cheap magic probe so a non-package app.pkg never reaches the parser. */
+static int games_is_pkg_image(const char *path) {
+  FILE *fp = fopen(path, "rb");
+  if (fp == NULL) {
+    return 0;
+  }
+  uint8_t magic[4] = {0};
+  size_t got = fread(magic, 1U, sizeof(magic), fp);
+  fclose(fp);
+  if (got != sizeof(magic)) {
+    return 0;
+  }
+  uint32_t be = ((uint32_t)magic[0] << 24) | ((uint32_t)magic[1] << 16) |
+                ((uint32_t)magic[2] << 8) | (uint32_t)magic[3];
+  return (be == PKG_MAGIC_CNT) || (be == PKG_MAGIC_PKG);
+}
+
+/**
+ * Load the param.sfo of an installed title.
+ *
+ * Titles installed as a directory tree keep it in sce_sys/param.sfo; the ones
+ * delivered as a single package (fpkg installers leave only app.pkg with
+ * app.json/app.pbm beside it) keep it inside the package image, which is why
+ * the entry is read from app.pkg when the plain file is missing.
+ *
+ * @return 0 with *out_data malloc()ed (caller frees) on success, -1 otherwise.
+ */
+static int games_load_installed_sfo(const char *app_dir, uint8_t **out_data,
+                                    size_t *out_size) {
+  if (app_dir == NULL || out_data == NULL || out_size == NULL) {
+    return -1;
+  }
+  *out_data = NULL;
+  *out_size = 0U;
+
+  char sfo_path[FTP_PATH_MAX];
+  int n = snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", app_dir);
+  if (n > 0 && (size_t)n < sizeof(sfo_path) && access(sfo_path, R_OK) == 0 &&
+      games_read_file(sfo_path, out_data, out_size, 65536U) == 0) {
+    return 0;
+  }
+  n = snprintf(sfo_path, sizeof(sfo_path), "%s/param.sfo", app_dir);
+  if (n > 0 && (size_t)n < sizeof(sfo_path) && access(sfo_path, R_OK) == 0 &&
+      games_read_file(sfo_path, out_data, out_size, 65536U) == 0) {
+    return 0;
+  }
+
+  char pkg_path[FTP_PATH_MAX];
+  n = snprintf(pkg_path, sizeof(pkg_path), "%s/app.pkg", app_dir);
+  if (n <= 0 || (size_t)n >= sizeof(pkg_path) ||
+      !games_is_pkg_image(pkg_path)) {
+    return -1;
+  }
+
+  pkg_context_t pkg;
+  if (pkg_init(&pkg, pkg_path) != PKG_OK) {
+    return -1;
+  }
+
+  int rc = -1;
+  const pkg_entry_t *entry = pkg_find_entry_by_id(&pkg, PKG_ENTRY_ID_PARAM_SFO);
+  if (entry != NULL && entry->size > 0U && entry->size <= 65536U &&
+      !pkg_entry_is_encrypted(entry)) {
+    uint8_t *buf = (uint8_t *)malloc((size_t)entry->size);
+    if (buf != NULL) {
+      if (pkg_extract_to_buffer(&pkg, entry, buf, (size_t)entry->size) > 0) {
+        *out_data = buf;
+        *out_size = (size_t)entry->size;
+        rc = 0;
+      } else {
+        free(buf);
+      }
+    }
+  }
+  pkg_cleanup(&pkg);
+  return rc;
+}
+
 int games_read_installed_sfo(const char *app_dir, char *title_id,
                                    size_t title_id_size, char *title_name,
                                    size_t title_name_size) {
@@ -190,22 +269,21 @@ int games_read_installed_sfo(const char *app_dir, char *title_id,
     return -1;
   }
 
-  char sfo_path[FTP_PATH_MAX];
-  int n = snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", app_dir);
-  if (n < 0 || (size_t)n >= sizeof(sfo_path) || access(sfo_path, R_OK) != 0) {
-    n = snprintf(sfo_path, sizeof(sfo_path), "%s/param.sfo", app_dir);
-    if (n < 0 || (size_t)n >= sizeof(sfo_path) || access(sfo_path, R_OK) != 0) {
-      return -1;
-    }
-  }
-
   uint8_t *sfo = NULL;
   size_t sfo_size = 0U;
-  if (games_read_file(sfo_path, &sfo, &sfo_size, 65536U) != 0) {
+  if (games_load_installed_sfo(app_dir, &sfo, &sfo_size) != 0) {
     return -1;
   }
 
+  /* The title id is already known from the directory name; a missing
+   * TITLE_ID must not erase it. */
+  char id_fallback[64] = {0};
+  (void)snprintf(id_fallback, sizeof(id_fallback), "%.63s", title_id);
+
   (void)games_sfo_get_string(sfo, sfo_size, "TITLE_ID", title_id, title_id_size);
+  if (title_id[0] == '\0') {
+    (void)snprintf(title_id, title_id_size, "%s", id_fallback);
+  }
   (void)games_sfo_get_string(sfo, sfo_size, "TITLE", title_name, title_name_size);
   if (title_name[0] == '\0') {
     (void)games_sfo_get_string(sfo, sfo_size, "TITLE_01", title_name,
@@ -226,18 +304,9 @@ int games_read_installed_sfo_field(const char *app_dir,
   }
   out[0] = '\0';
 
-  char sfo_path[FTP_PATH_MAX];
-  int n = snprintf(sfo_path, sizeof(sfo_path), "%s/sce_sys/param.sfo", app_dir);
-  if (n < 0 || (size_t)n >= sizeof(sfo_path) || access(sfo_path, R_OK) != 0) {
-    n = snprintf(sfo_path, sizeof(sfo_path), "%s/param.sfo", app_dir);
-    if (n < 0 || (size_t)n >= sizeof(sfo_path) || access(sfo_path, R_OK) != 0) {
-      return -1;
-    }
-  }
-
   uint8_t *sfo = NULL;
   size_t sfo_size = 0U;
-  if (games_read_file(sfo_path, &sfo, &sfo_size, 65536U) != 0) {
+  if (games_load_installed_sfo(app_dir, &sfo, &sfo_size) != 0) {
     return -1;
   }
 
