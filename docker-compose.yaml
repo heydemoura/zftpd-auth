@@ -1,0 +1,56 @@
+# zftpd — FTP server with the zhttp web interface.
+#
+#   docker compose up -d --build
+#
+# Every variable below can also come from a `.env` file next to this file.
+# The `${VAR:-default}` form means "use VAR if set, otherwise the default";
+# an empty value for ZFTPD_ADMIN_PASSWORD keeps the web interface open (no login).
+
+services:
+  zftpd:
+    build: .
+    image: zftpd:latest
+    container_name: zftpd
+    restart: unless-stopped
+    # Run as the host user that owns the files directory so uploads, renames
+    # and deletes work on the bind mount (e.g. ZFTPD_UID=$(id -u) in .env).
+    user: "${ZFTPD_UID:-1000}:${ZFTPD_GID:-1000}"
+
+    # FTP passive mode opens a random data port for every transfer, which
+    # cannot be published through Docker's NAT.  Host networking keeps FTP
+    # working; the ports below are then taken directly on the host.
+    network_mode: host
+    #
+    # Web interface only (no FTP from outside): comment out network_mode above
+    # and publish the HTTP port instead.
+    # ports:
+    #   - "${ZFTPD_HTTP_PORT:-8888}:8888"
+
+    environment:
+      # ── Listening ports and served directory ───────────────────────────
+      ZFTPD_FTP_PORT: "${ZFTPD_FTP_PORT:-2121}"
+      ZFTPD_HTTP_PORT: "${ZFTPD_HTTP_PORT:-8888}"
+      ZFTPD_ROOT: /srv/files
+
+      # ── Web interface login gate (off unless ZFTPD_ADMIN_PASSWORD is set) ─
+      # Turns the login gate on and creates/resets the administrator account.
+      ZFTPD_ADMIN_PASSWORD: "${ZFTPD_ADMIN_PASSWORD:-}"
+      # Login name of that administrator.
+      ZFTPD_ADMIN_USER: "${ZFTPD_ADMIN_USER:-admin}"
+      # "0" forces the gate off, "1" forces it on, empty = on whenever an
+      # administrator account exists in the state directory.
+      ZFTPD_HTTP_AUTH: "${ZFTPD_HTTP_AUTH:-}"
+      # Session lifetime in seconds (default 7 days).
+      ZFTPD_HTTP_SESSION_TTL: "${ZFTPD_HTTP_SESSION_TTL:-604800}"
+      # Where accounts, folder rules and share links are stored (the volume
+      # below).
+      ZFTPD_STATE_DIR: /var/lib/zftpd
+
+    volumes:
+      # Directory served over FTP and the web interface.
+      - "${ZFTPD_FILES:-./files}:/srv/files"
+      # Persisted web state: accounts, allowed folders, share links.
+      - zftpd-state:/var/lib/zftpd
+
+volumes:
+  zftpd-state:

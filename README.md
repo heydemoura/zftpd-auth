@@ -396,6 +396,21 @@ zero. Removing a completed record leaves the completed file untouched.
 ./build/macos/release/zftpd-macos-<arch>-v<version> [-p <port>] [-d <root>]
 ```
 
+### Docker (Linux)
+
+A multi-stage [`Dockerfile`](Dockerfile) builds the zhttp variant into a small
+Debian image, and [`docker-compose.yaml`](docker-compose.yaml) wires up the
+ports, the files volume, the persisted web state and every environment variable:
+
+```bash
+cp -n /dev/null .env            # optional: ZFTPD_ADMIN_PASSWORD=..., ZFTPD_FILES=/srv/files, ZFTPD_UID=$(id -u)
+docker compose up -d --build    # FTP on 2121, web interface on http://<host>:8888
+```
+
+The service uses host networking because FTP passive mode opens a random data
+port per transfer, which cannot be published through Docker's NAT; for a
+web-only deployment switch to the commented `ports:` block instead.
+
 ### PS4
 
 Send `.bin` to your payload loader, or `.elf` if the loader accepts ELF directly.  

@@ -1,0 +1,14 @@
+.git
+.github
+build
+ffi
+docs
+tests
+tools/qa
+web/legacy
+assets
+*.md
+!README.md
+Dockerfile
+docker-compose.yaml
+.dockerignore
