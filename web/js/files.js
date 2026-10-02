@@ -124,7 +124,7 @@
 
     S.loading = true;
     renderCrumbs(path);
-    dom.up.disabled = path === '/';
+    dom.up.disabled = ZF.isRoot(path) || !P.within(path, ZF.rootPath());
 
     clearTimeout(loadingTimer);
     if (!opts.silent) {
@@ -331,7 +331,8 @@
         hideHead: true,
         actions: [
           { label: 'Try again', icon: 'refresh', onclick: function () { load(S.path); } },
-          S.path !== '/' ? { label: 'Go to parent folder', icon: 'arrow-up', kind: 'primary', onclick: function () { go(P.parent(S.path)); } } : null
+          !ZF.isRoot(S.path) && P.within(S.path, ZF.rootPath()) ? { label: 'Go to parent folder', icon: 'arrow-up', kind: 'primary', onclick: function () { go(P.parent(S.path)); } } : null,
+          !P.within(S.path, ZF.rootPath()) || (ZF.auth.isUser() && !ZF.auth.pathAllowed(S.path)) ? { label: 'Go to start folder', icon: 'drive', kind: 'primary', onclick: function () { go(ZF.auth.homePath()); } } : null
         ].filter(Boolean)
       });
       return;
@@ -903,7 +904,7 @@
       }
       items.push('-');
     }
-    if (ZF.auth.canShare() && S.path && S.path !== '/') {
+    if (ZF.auth.canShare() && S.path && !ZF.isRoot(S.path)) {
       items.push({ label: 'Share this folder\u2026', icon: 'link', onclick: function () { ZF.shares.create(S.path, true); } });
       items.push('-');
     }
@@ -917,7 +918,7 @@
   function folderItems() {
     var path = S.path;
     return [
-      { label: isBookmarked(path) ? 'Remove folder from Places' : 'Add folder to Places', icon: 'bookmark', disabled: path === '/', onclick: function () { toggleBookmark(path); } },
+      { label: isBookmarked(path) ? 'Remove folder from Places' : 'Add folder to Places', icon: 'bookmark', disabled: ZF.isRoot(path), onclick: function () { toggleBookmark(path); } },
       { label: 'Copy folder path', icon: 'link', onclick: function () {
         ZF.copyText(path).then(function () { ZF.toast('Path copied', { type: 'success', timeout: 2000 }); });
       } }
@@ -1206,7 +1207,7 @@
   dom.back.addEventListener('click', function () { history.back(); });
   dom.forward.addEventListener('click', function () { history.forward(); });
   dom.up.addEventListener('click', function () {
-    if (S.path && S.path !== '/') { go(P.parent(S.path)); dom.list.focus(); }
+    if (S.path && !ZF.isRoot(S.path)) { go(P.parent(S.path)); dom.list.focus(); }
   });
   dom.more.addEventListener('click', function () { ZF.menu(moreMenu(), dom.more); });
 
@@ -1347,7 +1348,7 @@
 
     if (k === 'ArrowDown' || k === 'Down') moveCursor(1, e);
     else if (k === 'ArrowUp' || k === 'Up') {
-      if (e.altKey) { if (S.path !== '/') go(P.parent(S.path)); }
+      if (e.altKey) { if (!ZF.isRoot(S.path)) go(P.parent(S.path)); }
       else moveCursor(-1, e);
     }
     else if (k === 'PageDown') moveCursor(pageSize(), e);
@@ -1362,7 +1363,7 @@
         paintSelection();
       }
     }
-    else if (k === 'Backspace') { if (S.path !== '/') go(P.parent(S.path)); }
+    else if (k === 'Backspace') { if (!ZF.isRoot(S.path)) go(P.parent(S.path)); }
     else if (k === 'Escape' || k === 'Esc') { if (selectedCount()) clearSelection(); else handled = false; }
     else if ((k === 'Delete' || k === 'Del') && canWrite()) { if (sel.length) remove(sel); }
     else if (k === 'F2' && canWrite()) { if (sel.length === 1) rename(sel[0]); else if (!sel.length && cur) rename(cur); }
@@ -1420,7 +1421,8 @@
   /* ── Places (sidebar) ───────────────────────────────────────────────── */
 
   var placesEl = $('places');
-  var builtins = [{ path: '/', label: 'Root', icon: 'drive' }];
+  function defaultPlaces() { return [{ path: ZF.rootPath(), label: 'Root', icon: 'drive' }]; }
+  var builtins = defaultPlaces();
 
   function placeNode(p, removable) {
     var node = el('div', {
@@ -1447,7 +1449,7 @@
   function renderPlaces() {
     ZF.clear(placesEl);
     var inFiles = !dom.view.hidden;
-    var places = builtins;
+    var places = builtins.length && builtins[0].path === ZF.rootPath() ? builtins : defaultPlaces();
     if (ZF.auth.isUser()) {
       /* A restricted account: its allowed folders are the only places. */
       places = [];
@@ -1477,7 +1479,7 @@
   function discoverPlaces() {
     if (!ZF.auth.loggedIn() || ZF.auth.isUser()) { renderPlaces(); return; }
     Promise.all([
-      api.list('/').then(function (r) { return r.entries || []; }, function () { return []; }),
+      api.list(ZF.rootPath()).then(function (r) { return r.entries || []; }, function () { return []; }),
       /* The daemon reports the volumes that are actually mounted: the console
        * creates /mnt/usbN even with nothing plugged in, so listing the
        * directory showed every slot as a drive. */
@@ -1485,14 +1487,14 @@
     ]).then(function (res) {
       var root = {};
       for (var i = 0; i < res[0].length; i++) if (res[0][i].type === 'directory') root[res[0][i].name] = true;
-      var out = [{ path: '/', label: 'Root', icon: 'drive' }];
-      if (root.data) out.push({ path: '/data', label: 'data', icon: 'folder' });
-      if (root.user) out.push({ path: '/user', label: 'user', icon: 'folder' });
+      var out = defaultPlaces();
+      if (ZF.rootPath() === '/' && root.data) out.push({ path: '/data', label: 'data', icon: 'folder' });
+      if (ZF.rootPath() === '/' && root.user) out.push({ path: '/user', label: 'user', icon: 'folder' });
 
       var mounts = res[1].slice().sort(function (a, b) { return ZF.naturalCompare(a.name, b.name); });
       for (var k = 0; k < mounts.length; k++) {
         var m = mounts[k] || {};
-        if (!m.path) continue;
+        if (!m.path || !ZF.auth.pathAllowed(m.path)) continue;
         /* Slot numbering is what users recognise on the console; the volume
          * label stays available from /api/mounts for other views. */
         out.push({

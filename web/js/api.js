@@ -64,6 +64,7 @@
     if (status && status.features) {
       ZF.features.pkgInstall = status.features.pkg_install === true;
     }
+    if (status && status.root) ZF.server.root = ZF.path.norm(status.root);
     /* The login gate state rides along too (see auth.js). */
     if (status && status.auth) ZF.emit('auth-status', status.auth);
     return restarted;

@@ -317,6 +317,12 @@ window.ZF = ZF;
 
   ZF.features = { pkgInstall: false };
 
+  /* Facts reported by the daemon in /api/status. `root` is the directory it
+   * serves (`-d`): every path the interface shows lives inside it. */
+  ZF.server = { root: '/' };
+  ZF.rootPath = function () { return ZF.server.root || '/'; };
+  ZF.isRoot = function (p) { return ZF.path.norm(p) === ZF.rootPath(); };
+
   /* ── Misc ───────────────────────────────────────────────────────────── */
 
   ZF.debounce = function (fn, ms) {

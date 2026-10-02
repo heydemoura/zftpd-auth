@@ -306,9 +306,12 @@
 
   ZF.renderCrumbs = function (host, path, onNavigate, maxVisible) {
     ZF.clear(host);
-    var segs = ZF.path.segments(path);
-    var items = [{ label: '/', path: '/', root: true }];
-    var acc = '';
+    var root = ZF.rootPath();
+    var inside = ZF.path.within(path, root);
+    var rel = inside && root !== '/' ? path.slice(root.length) : path;
+    var segs = ZF.path.segments(rel);
+    var items = [{ label: '/', path: inside ? root : '/', root: true }];
+    var acc = inside && root !== '/' ? root : '';
     for (var i = 0; i < segs.length; i++) {
       acc += '/' + segs[i];
       items.push({ label: segs[i], path: acc });

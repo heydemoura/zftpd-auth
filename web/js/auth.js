@@ -34,13 +34,15 @@
   /** Where a freshly signed-in account should land. */
   auth.homePath = function () {
     var start = ZF.settings.startPath || '/';
-    if (!auth.isUser()) return start;
     if (auth.pathAllowed(start)) return start;
-    return state.folders.length ? state.folders[0] : '/';
+    if (auth.isUser()) return state.folders.length ? state.folders[0] : ZF.rootPath();
+    return ZF.rootPath();
   };
 
-  /** Mirrors the daemon rule: a restricted account only sees allowed folders. */
+  /** Mirrors the daemon rules: everything lives inside the served root, and a
+   *  restricted account only sees its allowed folders. */
   auth.pathAllowed = function (path) {
+    if (!ZF.path.within(path, ZF.rootPath())) return false;
     if (!auth.isUser()) return true;
     for (var i = 0; i < state.folders.length; i++) {
       if (ZF.path.within(path, state.folders[i])) return true;

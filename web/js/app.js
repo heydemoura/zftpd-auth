@@ -34,7 +34,7 @@
         if (!segs[i]) continue;
         try { out.push(decodeURIComponent(segs[i])); } catch (e) { out.push(segs[i]); }
       }
-      params.path = P.norm('/' + out.join('/'));
+      params.path = out.length ? P.norm('/' + out.join('/')) : ZF.auth.homePath();
     }
     return { name: name, params: params };
   }
@@ -285,7 +285,7 @@
     }
     if (current && !viewAllowed(current)) {
       replace(ZF.files.hashFor(ZF.auth.homePath()));
-    } else if (current === 'files' && ZF.auth.isUser() && ZF.files.current() !== null &&
+    } else if (current === 'files' && ZF.files.current() !== null &&
                !ZF.auth.pathAllowed(ZF.files.current())) {
       replace(ZF.files.hashFor(ZF.auth.homePath()));
     } else if (ZF.auth.loggedIn() && current && ZF.views[current] && ZF.views[current].enter) {

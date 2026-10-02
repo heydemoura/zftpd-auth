@@ -656,7 +656,7 @@ static http_response_t *api_status(const http_request_t *request) {
   uint64_t instance_id = ftp_daemon_instance_id();
   uint64_t start_ns = ftp_daemon_start_monotonic_ns();
 
-  char body[640];
+  char body[2048];
   size_t pos = 0U;
   size_t cap = sizeof(body);
 #if defined(PLATFORM_PS5)
@@ -674,7 +674,12 @@ static http_response_t *api_status(const http_request_t *request) {
       "\"features\":{\"pkg_install\":%s},",
       RELEASE_VERSION, (unsigned long long)instance_id, start_ns,
       (int)getpid(), platform, ENABLE_PKG_INSTALL ? "true" : "false");
-  if (pos >= cap || http_auth_status_json(request, body, cap, &pos) != 0 ||
+  /* The served root lets the web interface start inside it instead of at
+   * "/", which is only valid when the daemon serves the whole filesystem. */
+  if (pos >= cap || http_buf_append_cstr(body, cap, &pos, "\"root\":\"") != 0 ||
+      http_json_escape_append(body, cap, &pos, http_api_get_root()) != 0 ||
+      http_buf_append_cstr(body, cap, &pos, "\",") != 0 ||
+      http_auth_status_json(request, body, cap, &pos) != 0 ||
       http_buf_append_cstr(body, cap, &pos, "}") != 0) {
     return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
                                "Status response too large");
