@@ -60,6 +60,8 @@ static const char *status_text(http_status_t status) {
   /* 4xx */
   case HTTP_STATUS_400_BAD_REQUEST:
     return "Bad Request";
+  case HTTP_STATUS_401_UNAUTHORIZED:
+    return "Unauthorized";
   case HTTP_STATUS_403_FORBIDDEN:
     return "Forbidden";
   case HTTP_STATUS_404_NOT_FOUND:
@@ -68,6 +70,8 @@ static const char *status_text(http_status_t status) {
     return "Method Not Allowed";
   case HTTP_STATUS_409_CONFLICT:
     return "Conflict";
+  case HTTP_STATUS_410_GONE:
+    return "Gone";
   case HTTP_STATUS_415_UNSUPPORTED_MEDIA_TYPE:
     return "Unsupported Media Type";
   case HTTP_STATUS_416_RANGE_NOT_SATISFIABLE:

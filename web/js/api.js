@@ -64,6 +64,8 @@
     if (status && status.features) {
       ZF.features.pkgInstall = status.features.pkg_install === true;
     }
+    /* The login gate state rides along too (see auth.js). */
+    if (status && status.auth) ZF.emit('auth-status', status.auth);
     return restarted;
   }
 
@@ -186,6 +188,8 @@
     return fetch(url, init).then(function (r) {
       transportOk();
       return r.text().then(function (text) {
+        /* A session that expired or was revoked: bring the login back. */
+        if (r.status === 401 && url.indexOf('/api/auth/login') !== 0) ZF.emit('auth-required');
         if (!r.ok) throw httpError(r.status, text);
         if (!text) return {};
         try { return JSON.parse(text); } catch (e) { return text; }
@@ -229,6 +233,42 @@
   api.discState = function () { return get('/api/system/disc'); };
   api.discEject = function () { return post('/api/system/eject').then(soft); };
   api.notify = function (text) { return post('/api/notify' + qs({ text: text })); };
+
+  /* ── Login gate, users and shares ───────────────────────────────────── */
+
+  api.login = function (login, password) { return post('/api/auth/login', { login: login, password: password }); };
+  api.logout = function () { return post('/api/auth/logout'); };
+  api.me = function () { return get('/api/auth/me'); };
+  api.changePassword = function (current, password) {
+    return post('/api/auth/password', { current: current, password: password });
+  };
+  api.users = function () { return get('/api/auth/users'); };
+  api.userAdd = function (login, password, role) {
+    return post('/api/auth/users', { login: login, password: password, role: role });
+  };
+  api.userUpdate = function (login, fields) {
+    var body = { login: login };
+    if (fields && fields.password) body.password = fields.password;
+    if (fields && fields.role) body.role = fields.role;
+    return post('/api/auth/users/update', body);
+  };
+  api.userDelete = function (login) { return post('/api/auth/users/delete', { login: login }); };
+  api.accessFolders = function () { return get('/api/auth/access'); };
+  api.accessSet = function (folders) { return post('/api/auth/access', { folders: folders }); };
+
+  api.shares = function () { return get('/api/shares'); };
+  /* opts: { ttl: seconds } or { expires: unix seconds }; neither = never. */
+  api.shareCreate = function (path, opts) {
+    var body = { path: path };
+    if (opts && opts.ttl) body.ttl = opts.ttl;
+    else if (opts && opts.expires) body.expires = opts.expires;
+    else body.expires = 0;
+    return post('/api/shares/create', body);
+  };
+  api.shareDelete = function (id) { return post('/api/shares/delete', { id: id }); };
+  api.sharePurge = function () { return post('/api/shares/purge'); };
+  /* Absolute link as the recipient will open it. */
+  api.shareUrl = function (share) { return location.protocol + '//' + location.host + share.url; };
 
   /* ── Files ──────────────────────────────────────────────────────────── */
 

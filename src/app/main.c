@@ -114,7 +114,9 @@ static void *net_filter_install_deferred(void *unused) {
 #include "ftp_log.h"
 #include "http_api.h"
 #include "http_config.h"
+#include "http_auth.h"
 #include "http_csrf.h"
+#include "http_share.h"
 #include "http_server.h"
 #include "transfer/transfer_manager.h"
 
@@ -477,6 +479,9 @@ int main(void) {
 #if ENABLE_MCP
   static mcp_server_t *g_mcp_server = NULL;
 #endif
+  /* Optional login gate and public share links (see http_auth.h). */
+  (void)http_auth_init();
+  http_share_init();
   if (http_csrf_init() != 0) {
     ftp_log_line(FTP_LOG_WARN, "CSRF init failed: web upload disabled");
   }
@@ -836,6 +841,9 @@ int main(void) {
 #endif
   /* Restore persisted downloads before exposing the PS5 Transfers UI. */
   (void)transfer_manager_restore();
+  /* Optional login gate and public share links (see http_auth.h). */
+  (void)http_auth_init();
+  http_share_init();
   if (http_csrf_init() != 0) {
     ftp_log_line(FTP_LOG_WARN, "CSRF init failed: web upload disabled");
   }
@@ -944,6 +952,15 @@ static void print_usage(const char *program) {
 #endif
   printf("  -h            Show this help message\n");
   printf("\n");
+#if ENABLE_ZHTTPD
+  printf("Environment (web interface login, off unless set):\n");
+  printf("  ZFTPD_ADMIN_PASSWORD   require a login; creates/resets the admin account\n");
+  printf("  ZFTPD_ADMIN_USER       admin login name (default: admin)\n");
+  printf("  ZFTPD_HTTP_AUTH        0 = force the login gate off, 1 = force it on\n");
+  printf("  ZFTPD_HTTP_SESSION_TTL session lifetime in seconds (default: 7 days)\n");
+  printf("  ZFTPD_STATE_DIR        accounts, folder rules and share links storage\n");
+  printf("\n");
+#endif
   printf("Example:\n");
   printf("  %s -p 2121 -d /home/ftp\n", program);
   printf("\n");
@@ -1063,6 +1080,9 @@ int main(int argc, char **argv) {
    * ZHTTPD — Start Web File Explorer
    *=========================================================================*/
 #if ENABLE_ZHTTPD
+  /* Optional login gate and public share links (see http_auth.h). */
+  (void)http_auth_init();
+  http_share_init();
   if (http_csrf_init() != 0) {
     ftp_log_line(FTP_LOG_WARN, "CSRF init failed: web upload disabled");
   }

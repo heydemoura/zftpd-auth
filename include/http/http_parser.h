@@ -54,6 +54,10 @@ typedef struct {
     size_t num_headers;
     char *body;
     size_t body_length;
+    /* Filled by the authentication gate before a handler runs (see
+     * http_auth.h): HTTP_ROLE_NONE until then. */
+    int auth_role;
+    char auth_login[33];
 } http_request_t;
 
 typedef struct {

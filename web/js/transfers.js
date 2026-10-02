@@ -405,6 +405,15 @@
   }
 
   function refresh() {
+    /* Server downloads are an administrator feature: a restricted account
+     * neither sees the view nor polls it. */
+    if (ZF.auth && !ZF.auth.isAdmin()) {
+      downloads = [];
+      loaded = true;
+      loadError = null;
+      render();
+      return Promise.resolve();
+    }
     var dumpRequest = api.dumpStatus().then(renderDump, function () {});
     return api.downloadStatus().then(function (res) {
       downloads = (res && res.downloads) || [];

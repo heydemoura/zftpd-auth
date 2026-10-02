@@ -112,6 +112,7 @@
 
     <nav class="nav" id="nav">
       <a class="nav-item" href="#/files" data-view="files"><svg class="ic" aria-hidden="true"><use xlink:href="#i-folder"></use></svg><span class="nav-label">Files</span></a>
+      <a class="nav-item" href="#/shares" data-view="shares"><svg class="ic" aria-hidden="true"><use xlink:href="#i-link"></use></svg><span class="nav-label">Shares</span></a>
       <a class="nav-item" href="#/transfers" data-view="transfers"><svg class="ic" aria-hidden="true"><use xlink:href="#i-transfer"></use></svg><span class="nav-label">Transfers</span><span class="badge" id="nav-badge" hidden></span></a>
       <a class="nav-item" href="#/games" data-view="games"><svg class="ic" aria-hidden="true"><use xlink:href="#i-gamepad"></use></svg><span class="nav-label">Games</span></a>
       <a class="nav-item" href="#/system" data-view="system"><svg class="ic" aria-hidden="true"><use xlink:href="#i-server"></use></svg><span class="nav-label">System</span></a>
@@ -124,6 +125,14 @@
     </div>
 
     <div class="side-foot">
+      <div class="side-user" id="side-user" hidden>
+        <div class="side-user-avatar" id="side-user-avatar" aria-hidden="true"></div>
+        <div class="side-user-text">
+          <div class="side-user-name" id="side-user-name"></div>
+          <div class="side-user-role" id="side-user-role"></div>
+        </div>
+        <button class="side-user-logout" id="side-logout" type="button" title="Sign out" aria-label="Sign out"><svg class="ic" aria-hidden="true"><use xlink:href="#i-power"></use></svg></button>
+      </div>
       <a class="side-support" href="https://www.seregonwar.com/donations" target="_blank" rel="noopener noreferrer" title="Support zftpd">
         <svg class="ic" aria-hidden="true"><use xlink:href="#i-heart"></use></svg><span class="side-label-text">Support zftpd</span>
       </a>
@@ -210,6 +219,23 @@
         </div>
         <input type="file" id="f-upload-files" multiple hidden>
         <input type="file" id="f-upload-folder" multiple webkitdirectory hidden>
+      </section>
+
+      <!-- Shares -->
+      <section class="view page" id="view-shares" hidden>
+        <div class="page-head">
+          <h1 class="page-title">Shares</h1>
+          <span class="page-meta" id="shares-meta"></span>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="shares-purge" type="button" hidden>Remove expired</button>
+            <button class="btn" id="shares-new" type="button"><svg class="ic" aria-hidden="true"><use xlink:href="#i-link"></use></svg><span>Share a folder</span></button>
+            <button class="btn btn-icon" id="shares-refresh" type="button" title="Refresh" aria-label="Refresh"><svg class="ic" aria-hidden="true"><use xlink:href="#i-refresh"></use></svg></button>
+          </div>
+        </div>
+        <div class="page-body">
+          <p class="section-note shares-intro">Share links work without a login. File links download directly; folder links open a page where the folder can be browsed and downloaded as a ZIP.</p>
+          <div class="card" id="shares-list"></div>
+        </div>
       </section>
 
       <!-- Transfers -->
@@ -378,14 +404,34 @@
   </div>
 </div>
 
+<div class="login" id="login" hidden>
+  <form class="login-card" id="login-form" autocomplete="on" novalidate>
+    <img class="login-mark" src="img/zftpd-mark.png" width="56" height="56" alt="">
+    <h1 class="login-title">Sign in to zftpd</h1>
+    <p class="login-sub" id="login-sub">This web interface requires an account.</p>
+    <div class="field">
+      <label class="field-label" for="login-user">Login</label>
+      <input class="input" id="login-user" type="text" autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label class="field-label" for="login-pass">Password</label>
+      <input class="input" id="login-pass" type="password" autocomplete="current-password">
+    </div>
+    <div class="field-error" id="login-error" role="alert"></div>
+    <button class="btn btn-primary btn-block login-submit" id="login-submit" type="submit"><span>Sign in</span></button>
+  </form>
+</div>
+
 <div class="tray" id="tray" hidden></div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script src="js/core.js"></script>
 <script src="js/api.js"></script>
 <script src="js/ui.js"></script>
+<script src="js/auth.js"></script>
 <script src="js/jobs.js"></script>
 <script src="js/files.js"></script>
+<script src="js/shares.js"></script>
 <script src="js/transfers.js"></script>
 <script src="js/games.js"></script>
 <script src="js/system.js"></script>

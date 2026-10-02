@@ -501,6 +501,9 @@
       title: 'Download the selection as a ZIP archive (folders included)',
       onclick: function () { downloadZip(sel); }
     }));
+    if (one && ZF.auth.canShare()) {
+      bar.appendChild(cmd({ icon: 'link', label: 'Share', collapse: true, title: 'Create a share link', onclick: function () { share(one); } }));
+    }
     if (write) {
       if (one) bar.appendChild(cmd({ icon: 'pencil', label: 'Rename', collapse: true, title: 'Rename (F2)', onclick: function () { rename(one); } }));
       bar.appendChild(cmd({ icon: 'copy', label: 'Copy to\u2026', collapse: true, onclick: function () { transferTo('copy', sel); } }));
@@ -598,6 +601,10 @@
     }, function (e) {
       ZF.toastError(e, 'ZIP failed');
     });
+  }
+
+  function share(e) {
+    ZF.shares.create(entryPath(e), !!e.isDir);
   }
 
   function download(entries) {
@@ -841,6 +848,7 @@
       if (one) items.push({ label: one.isDir ? 'Open' : 'Open details', icon: one.isDir ? 'folder' : 'eye', hint: 'Enter', onclick: function () { openEntry(one); } });
       if (allFiles) items.push({ label: 'Download', icon: 'download', onclick: function () { download(sel); } });
       items.push({ label: 'Download as ZIP', icon: 'archive', onclick: function () { downloadZip(sel); } });
+      if (one && ZF.auth.canShare()) items.push({ label: 'Share\u2026', icon: 'link', onclick: function () { share(one); } });
       if (write && one && !one.isDir && ZF.isArchive(one.name)) {
         items.push('-');
         items = items.concat(extractItems(one));
@@ -893,6 +901,10 @@
         items.push('-');
         items.push({ label: 'Paste ' + ZF.plural(S.clip.paths.length, 'item'), icon: 'copy', hint: 'Ctrl+V', onclick: paste });
       }
+      items.push('-');
+    }
+    if (ZF.auth.canShare() && S.path && S.path !== '/') {
+      items.push({ label: 'Share this folder\u2026', icon: 'link', onclick: function () { ZF.shares.create(S.path, true); } });
       items.push('-');
     }
     items.push({ label: 'Refresh', icon: 'refresh', onclick: function () { reload(false); } });
@@ -1435,14 +1447,24 @@
   function renderPlaces() {
     ZF.clear(placesEl);
     var inFiles = !dom.view.hidden;
-    for (var i = 0; i < builtins.length; i++) {
-      var b = builtins[i];
+    var places = builtins;
+    if (ZF.auth.isUser()) {
+      /* A restricted account: its allowed folders are the only places. */
+      places = [];
+      var allowed = ZF.auth.folders();
+      for (var a = 0; a < allowed.length; a++) {
+        places.push({ path: allowed[a], label: allowed[a] === '/' ? 'Root' : P.base(allowed[a]), icon: 'folder' });
+      }
+    }
+    for (var i = 0; i < places.length; i++) {
+      var b = places[i];
       var node = placeNode(b, false);
       if (!inFiles) node.className = 'place';
       placesEl.appendChild(node);
     }
     var bm = ZF.settings.bookmarks;
     for (var j = 0; j < bm.length; j++) {
+      if (!ZF.auth.pathAllowed(bm[j])) continue;
       var n = placeNode({ path: bm[j], label: P.base(bm[j]), icon: 'bookmark' }, true);
       if (!inFiles) n.className = 'place';
       placesEl.appendChild(n);
@@ -1453,6 +1475,7 @@
   }
 
   function discoverPlaces() {
+    if (!ZF.auth.loggedIn() || ZF.auth.isUser()) { renderPlaces(); return; }
     Promise.all([
       api.list('/').then(function (r) { return r.entries || []; }, function () { return []; }),
       /* The daemon reports the volumes that are actually mounted: the console
@@ -1491,6 +1514,7 @@
   });
   ZF.on('files-path', renderPlaces);
   ZF.on('view', renderPlaces);
+  ZF.on('auth', function () { renderPlaces(); discoverPlaces(); if (!dom.view.hidden) renderCommands(); });
   ZF.on('bookmark-renamed', function (r) {
     var list = ZF.settings.bookmarks.slice();
     var changed = false;

@@ -7,12 +7,15 @@
 #include "http_api_internal.h"
 #include "games/games_internal.h"
 #include "ftp_config.h"
+#include "http_auth.h"
 #include "http_csrf.h"
+#include "http_share.h"
 #include <stddef.h>
 
 typedef http_response_t *(*http_domain_handler_t)(const http_request_t *);
 
 static const http_domain_handler_t k_api_domains[] = {
+    http_api_auth_handle,
     http_api_transfer_handle,
     http_api_files_handle,
     http_api_system_handle,
@@ -45,8 +48,14 @@ static http_response_t *legacy_api_handle(const http_request_t *request) {
   return NULL;
 }
 
-http_response_t *http_api_handle(const http_request_t *request) {
+http_response_t *http_api_handle(http_request_t *request) {
   if (request == NULL) return NULL;
+
+  /* Login gate first: it also stamps the caller's identity on the request
+   * so handlers can apply per-user rules.  Public share links bypass it. */
+  http_response_t *denied = http_auth_gate(request, NULL);
+  if (denied != NULL) return denied;
+  if (http_share_route_matches(request->uri)) return http_share_handle(request);
 
 #if ENABLE_WEB_UPLOAD
   if (request->method == HTTP_METHOD_POST && http_csrf_validate(request) != 0) {

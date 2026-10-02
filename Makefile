@@ -335,6 +335,10 @@ ifeq ($(ENABLE_ZHTTPD),1)
     SOURCES += src/http/http_api_archive.c
     SOURCES += src/http/http_api_dump.c
     SOURCES += src/http/http_csrf.c
+    SOURCES += src/http/http_sha256.c
+    SOURCES += src/http/http_auth.c
+    SOURCES += src/http/http_share.c
+    SOURCES += src/http/http_api_auth.c
     WEB_RESOURCE_FILES := $(shell find web -path web/legacy -prune -o -type f -print | sort)
     HTTP_RESOURCES_C := $(BUILD_DIR)/generated/http/http_resources.c
     SOURCES += $(HTTP_RESOURCES_C)
@@ -993,6 +997,10 @@ TEST_BINS += $(BUILD_DIR)/tests/test_zip_writer
 TEST_BINS += $(BUILD_DIR)/tests/test_pal_volume
 TEST_BINS += $(BUILD_DIR)/tests/test_http_archive
 TEST_BINS += $(BUILD_DIR)/tests/test_dump_job
+TEST_BINS += $(BUILD_DIR)/tests/test_http_sha256
+TEST_BINS += $(BUILD_DIR)/tests/test_http_auth
+TEST_BINS += $(BUILD_DIR)/tests/test_http_share
+TEST_BINS += $(BUILD_DIR)/tests/test_http_auth_server
 endif
 
 ifeq ($(filter $(TARGET),linux macos),)

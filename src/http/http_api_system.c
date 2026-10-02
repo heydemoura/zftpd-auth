@@ -1,6 +1,7 @@
 /* HTTP system, telemetry, disk and network-admin API. */
 #include "http_api.h"
 #include "http_api_internal.h"
+#include "http_auth.h"
 #include "ftp_config.h"
 #include "pal_limits.h"
 #include "ftp_instance.h"
@@ -652,12 +653,10 @@ static http_response_t *api_stats_system(const http_request_t *request) {
 
 
 static http_response_t *api_status(const http_request_t *request) {
-  (void)request;
-
   uint64_t instance_id = ftp_daemon_instance_id();
   uint64_t start_ns = ftp_daemon_start_monotonic_ns();
 
-  char body[384];
+  char body[640];
   size_t pos = 0U;
   size_t cap = sizeof(body);
 #if defined(PLATFORM_PS5)
@@ -672,9 +671,14 @@ static http_response_t *api_status(const http_request_t *request) {
       body + pos, cap - pos,
       "{\"ok\":true,\"version\":\"%s\",\"instance_id\":\"%016llx\","
       "\"start_monotonic_ns\":%" PRIu64 ",\"pid\":%d,\"platform\":\"%s\","
-      "\"features\":{\"pkg_install\":%s}}",
+      "\"features\":{\"pkg_install\":%s},",
       RELEASE_VERSION, (unsigned long long)instance_id, start_ns,
       (int)getpid(), platform, ENABLE_PKG_INSTALL ? "true" : "false");
+  if (pos >= cap || http_auth_status_json(request, body, cap, &pos) != 0 ||
+      http_buf_append_cstr(body, cap, &pos, "}") != 0) {
+    return http_api_error_json(HTTP_STATUS_500_INTERNAL_ERROR,
+                               "Status response too large");
+  }
 
   http_response_t *resp = http_response_create(HTTP_STATUS_200_OK);
   http_response_add_header(resp, "Content-Type", "application/json");

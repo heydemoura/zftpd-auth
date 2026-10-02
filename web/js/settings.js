@@ -133,10 +133,258 @@
     ZF.dialog({ title: 'Keyboard shortcuts', size: 'md', content: dl, actions: [{ id: 'ok', label: 'Close', kind: 'primary', submit: true }] });
   }
 
+  /* ── Account, users and folder rules ──────────────────────────────────
+   * Users and the allow-list live in the daemon (see /api/auth/*).  The
+   * sections are rendered from a cached copy and refreshed after each change.
+   */
+
+  var users = null;      /* [{login, role}] or null until loaded */
+  var folders = null;    /* [path] or null until loaded */
+  var adminError = null;
+
+  function loadAdmin() {
+    if (!ZF.auth.isAdmin()) return;
+    Promise.all([ZF.api.users(), ZF.api.accessFolders()]).then(function (res) {
+      users = (res[0] && res[0].users) || [];
+      folders = (res[1] && res[1].folders) || [];
+      adminError = null;
+      if (!ZF.byId('view-settings').hidden) render();
+    }, function (err) {
+      adminError = err.message;
+      if (!ZF.byId('view-settings').hidden) render();
+    });
+  }
+
+  function passwordField(id, label, autocomplete) {
+    var input = el('input', { class: 'input', id: id, type: 'password', autocomplete: autocomplete || 'new-password' });
+    return { input: input, node: el('div', { class: 'field' }, [el('label', { class: 'field-label', for: id, text: label }), input]) };
+  }
+
+  function changePassword() {
+    var cur = passwordField('pw-current', 'Current password', 'current-password');
+    var next = passwordField('pw-new', 'New password');
+    var again = passwordField('pw-again', 'Repeat new password');
+    var error = el('div', { class: 'field-error', role: 'alert' });
+    var content = el('div', { class: 'pw-form' }, [cur.node, next.node, again.node, error,
+      el('div', { class: 'field-hint', text: 'At least 6 characters.' })]);
+    ZF.dialog({
+      title: 'Change password',
+      content: content,
+      actions: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Change password', kind: 'primary', submit: true }],
+      onOpen: function () { cur.input.focus(); },
+      onAction: function (id) {
+        if (id !== 'ok') return true;
+        if (next.input.value.length < 6) { error.textContent = 'The new password needs at least 6 characters.'; next.input.focus(); return false; }
+        if (next.input.value !== again.input.value) { error.textContent = 'The new passwords do not match.'; again.input.focus(); return false; }
+        error.textContent = '';
+        return ZF.api.changePassword(cur.input.value, next.input.value).then(function () {
+          ZF.toast('Password changed', { type: 'success' });
+          return true;
+        }, function (err) { error.textContent = err.message; cur.input.focus(); return false; });
+      }
+    });
+  }
+
+  function roleSelect(value) {
+    var sel = el('select', { class: 'input', 'aria-label': 'Role' }, [
+      el('option', { value: 'user', text: 'User' }),
+      el('option', { value: 'admin', text: 'Administrator' })
+    ]);
+    sel.value = value || 'user';
+    return sel;
+  }
+
+  function addUser() {
+    var login = el('input', { class: 'input', id: 'nu-login', type: 'text', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', maxlength: '32' });
+    var pw = passwordField('nu-pw', 'Password');
+    var role = roleSelect('user');
+    var error = el('div', { class: 'field-error', role: 'alert' });
+    var content = el('div', { class: 'pw-form' }, [
+      el('div', { class: 'field' }, [el('label', { class: 'field-label', for: 'nu-login', text: 'Login' }), login,
+        el('div', { class: 'field-hint', text: 'Letters, digits and . _ - @ only.' })]),
+      pw.node,
+      el('div', { class: 'field' }, [el('label', { class: 'field-label', text: 'Role' }), role,
+        el('div', { class: 'field-hint', text: 'Users only see the folders listed under “Folders for users” and cannot create shares. Administrators can do everything.' })]),
+      error
+    ]);
+    ZF.dialog({
+      title: 'Add user',
+      content: content,
+      actions: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Add user', kind: 'primary', submit: true }],
+      onOpen: function () { login.focus(); },
+      onAction: function (id) {
+        if (id !== 'ok') return true;
+        if (!/^[A-Za-z0-9._@-]{1,32}$/.test(login.value)) { error.textContent = 'Enter a valid login.'; login.focus(); return false; }
+        if (pw.input.value.length < 6) { error.textContent = 'The password needs at least 6 characters.'; pw.input.focus(); return false; }
+        error.textContent = '';
+        return ZF.api.userAdd(login.value, pw.input.value, role.value).then(function (res) {
+          users = (res && res.users) || users;
+          ZF.toast('User ' + login.value + ' added', { type: 'success' });
+          render();
+          return true;
+        }, function (err) { error.textContent = err.message; return false; });
+      }
+    });
+  }
+
+  function editUser(u) {
+    var self = u.login === ZF.auth.user();
+    var role = roleSelect(u.role);
+    role.disabled = self;
+    var pw = passwordField('eu-pw', 'New password');
+    var error = el('div', { class: 'field-error', role: 'alert' });
+    var content = el('div', { class: 'pw-form' }, [
+      el('div', { class: 'field' }, [el('label', { class: 'field-label', text: 'Role' }), role,
+        self ? el('div', { class: 'field-hint', text: 'Your own role can only be changed by another administrator.' }) : null]),
+      pw.node,
+      el('div', { class: 'field-hint', text: 'Leave the password empty to keep the current one. Setting a new one signs that user out everywhere.' }),
+      error
+    ]);
+    ZF.dialog({
+      title: 'Edit ' + u.login,
+      content: content,
+      actions: [{ id: 'cancel', label: 'Cancel' }, { id: 'ok', label: 'Save', kind: 'primary', submit: true }],
+      onAction: function (id) {
+        if (id !== 'ok') return true;
+        var fields = {};
+        if (!self && role.value !== u.role) fields.role = role.value;
+        if (pw.input.value) {
+          if (pw.input.value.length < 6) { error.textContent = 'The password needs at least 6 characters.'; pw.input.focus(); return false; }
+          fields.password = pw.input.value;
+        }
+        if (!fields.role && !fields.password) return true;
+        error.textContent = '';
+        return ZF.api.userUpdate(u.login, fields).then(function (res) {
+          users = (res && res.users) || users;
+          ZF.toast('User ' + u.login + ' updated', { type: 'success' });
+          render();
+          return true;
+        }, function (err) { error.textContent = err.message; return false; });
+      }
+    });
+  }
+
+  function deleteUser(u) {
+    ZF.confirm({
+      title: 'Remove ' + u.login + '?',
+      message: 'The account is deleted and its sessions end immediately.',
+      confirmLabel: 'Remove user', danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      ZF.api.userDelete(u.login).then(function (res) {
+        users = (res && res.users) || users;
+        ZF.toast('User ' + u.login + ' removed', { type: 'success' });
+        render();
+      }, ZF.toastError);
+    });
+  }
+
+  function usersCard() {
+    if (adminError) return el('div', { class: 'empty-inline', text: adminError });
+    if (users === null) return el('div', { class: 'empty-inline', text: 'Loading…' });
+    var tbody = el('tbody');
+    for (var i = 0; i < users.length; i++) {
+      (function (u) {
+        var self = u.login === ZF.auth.user();
+        tbody.appendChild(el('tr', null, [
+          el('td', { class: 'col-login', text: u.login + (self ? ' (you)' : '') }),
+          el('td', null, el('span', { class: 'role-pill' + (u.role === 'admin' ? ' is-admin' : ''), text: u.role === 'admin' ? 'Administrator' : 'User' })),
+          el('td', { class: 'col-actions' }, el('div', { class: 'row-actions' }, [
+            ZF.button({ icon: 'pencil', aria: 'Edit ' + u.login, title: 'Edit', kind: 'ghost', size: 'sm', onclick: function () { editUser(u); } }),
+            ZF.button({ icon: 'trash', aria: 'Remove ' + u.login, title: 'Remove', kind: 'ghost', size: 'sm', cls: 'btn-danger-text', disabled: self, onclick: function () { deleteUser(u); } })
+          ]))
+        ]));
+      })(users[i]);
+    }
+    var table = el('table', { class: 'table users-table' }, [
+      el('colgroup', null, [el('col'), el('col', { style: 'width:140px' }), el('col', { style: 'width:90px' })]),
+      el('thead', null, el('tr', null, [el('th', { text: 'Login' }), el('th', { text: 'Role' }), el('th', null, el('span', { class: 'sr-only', text: 'Actions' }))])),
+      tbody
+    ]);
+    return el('div', null, [
+      users.length ? table : el('div', { class: 'empty-inline', text: 'No accounts yet.' }),
+      el('div', { class: 'card-foot' }, [
+        ZF.button({ icon: 'plus', label: 'Add user', size: 'sm', onclick: addUser })
+      ])
+    ]);
+  }
+
+  function saveFolders(list) {
+    return ZF.api.accessSet(list).then(function (res) {
+      folders = (res && res.folders) || list;
+      render();
+    }, function (err) { ZF.toastError(err); render(); });
+  }
+
+  function foldersCard() {
+    if (adminError) return el('div', { class: 'empty-inline', text: adminError });
+    if (folders === null) return el('div', { class: 'empty-inline', text: 'Loading…' });
+    var list = el('ul', { class: 'folder-list' });
+    for (var i = 0; i < folders.length; i++) {
+      (function (f) {
+        list.appendChild(el('li', { class: 'folder-item' }, [
+          ZF.icon('folder'),
+          el('span', { class: 'folder-item-path', text: f, title: f }),
+          ZF.button({ icon: 'x', aria: 'Remove ' + f, title: 'Remove', kind: 'ghost', size: 'sm', onclick: function () {
+            var next = [];
+            for (var k = 0; k < folders.length; k++) if (folders[k] !== f) next.push(folders[k]);
+            saveFolders(next);
+          } })
+        ]));
+      })(folders[i]);
+    }
+    return el('div', null, [
+      folders.length ? list : el('div', { class: 'empty-inline', text: 'No folders yet: accounts with the User role cannot open anything until a folder is added here.' }),
+      el('div', { class: 'card-foot' }, [
+        ZF.button({ icon: 'folder-plus', label: 'Add folder', size: 'sm', onclick: function () {
+          ZF.pickFolder({ title: 'Folder for users', start: ZF.files.current() || '/', confirmLabel: 'Allow this folder' }).then(function (p) {
+            if (!p) return;
+            for (var k = 0; k < folders.length; k++) if (folders[k] === p) return;
+            saveFolders(folders.concat([p]));
+          });
+        } })
+      ])
+    ]);
+  }
+
+  function accessSections() {
+    var out = [];
+    var enabled = ZF.auth.enabled();
+    if (enabled && ZF.auth.loggedIn()) {
+      out.push(section('Account', [
+        setting('Signed in as', ZF.auth.role() === 'admin' ? 'Administrator' : 'User', el('span', { class: 'mono', text: ZF.auth.user() })),
+        setting('Password', 'Change the password of this account.', ZF.button({ label: 'Change password', size: 'sm', onclick: changePassword }))
+      ]));
+    }
+    if (!ZF.auth.isAdmin()) return out;
+    out.push(section('Users', [
+      el('div', { class: 'setting' }, el('div', { class: 'setting-text' }, [
+        el('div', { class: 'setting-title', text: enabled ? 'Login required' : 'Login gate off' }),
+        el('div', { class: 'setting-desc', text: enabled
+          ? 'Everyone must sign in to use this interface. Share links stay public.'
+          : 'Anyone on the network can use this interface. Start zftpd with ZFTPD_ADMIN_PASSWORD set to require a login; accounts created here are kept for when it is on.' })
+      ])),
+      usersCard()
+    ]));
+    out.push(section('Folders for users', [
+      el('div', { class: 'setting' }, el('div', { class: 'setting-text' }, [
+        el('div', { class: 'setting-title', text: 'Allowed folders' }),
+        el('div', { class: 'setting-desc', text: 'Accounts with the User role can only browse, download and change files inside these folders (and their subfolders). Administrators are never restricted.' })
+      ])),
+      foldersCard()
+    ]));
+    return out;
+  }
+
   function render() {
     ZF.clear(body);
     var info = ZF.api.info || {};
-    loadDns();
+    var admin = ZF.auth.isAdmin();
+    if (admin) loadDns();
+    if (admin && users === null && !adminError) loadAdmin();
+
+    var access = accessSections();
+    for (var a = 0; a < access.length; a++) body.appendChild(access[a]);
 
     body.appendChild(section('Appearance', [
       setting('Theme', 'System follows your device setting.', segmented('theme', [
@@ -160,13 +408,15 @@
         toggle('decryptSelf', 'Decrypt protected files'))
     ]));
 
-    var dnsRows = [
-      setting('Block Sony CDN (DNS)',
-        'Answers the Sony content-delivery names with 0.0.0.0 so the console stops downloading from them. Point this console\'s DNS server at this address to use it.',
-        dnsSwitch()),
-      setting('Filter state', dnsStatusText(), el('span', { class: 'mono', text: dnsState.running ? 'Active' : 'Off' }))
-    ];
-    body.appendChild(section('Network', dnsRows));
+    if (admin) {
+      var dnsRows = [
+        setting('Block Sony CDN (DNS)',
+          'Answers the Sony content-delivery names with 0.0.0.0 so the console stops downloading from them. Point this console\'s DNS server at this address to use it.',
+          dnsSwitch()),
+        setting('Filter state', dnsStatusText(), el('span', { class: 'mono', text: dnsState.running ? 'Active' : 'Off' }))
+      ];
+      body.appendChild(section('Network', dnsRows));
+    }
 
     body.appendChild(section('About', [
       about(info),
@@ -268,10 +518,16 @@
   }
 
   ZF.on('status', function () { if (!ZF.byId('view-settings').hidden) render(); });
+  ZF.on('auth', function () {
+    users = null;
+    folders = null;
+    adminError = null;
+    if (!ZF.byId('view-settings').hidden) render();
+  });
 
   ZF.views.settings = {
     title: 'Settings',
-    enter: render,
+    enter: function () { if (ZF.auth.isAdmin()) loadAdmin(); render(); },
     leave: function () {}
   };
   ZF.showShortcuts = shortcuts;

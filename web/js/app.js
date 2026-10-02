@@ -4,8 +4,10 @@
 
   var $ = ZF.byId;
   var P = ZF.path;
-  var VIEWS = ['files', 'transfers', 'games', 'system', 'settings'];
-  var TITLES = { files: 'Files', transfers: 'Transfers', games: 'Games', system: 'System', settings: 'Settings' };
+  var VIEWS = ['files', 'shares', 'transfers', 'games', 'system', 'settings'];
+  var TITLES = { files: 'Files', shares: 'Shares', transfers: 'Transfers', games: 'Games', system: 'System', settings: 'Settings' };
+  /* Views a restricted ("user") account never sees. */
+  var ADMIN_VIEWS = { shares: true, transfers: true, games: true, system: true };
 
   var app = $('app');
   var current = null;
@@ -43,10 +45,14 @@
     fwd.disabled = navIndex >= navMax;
   }
 
+  function viewAllowed(name) {
+    return !ADMIN_VIEWS[name] || ZF.auth.isAdmin();
+  }
+
   function route(meta) {
     var hash = location.hash || '';
     var r = parse(hash);
-    if (!r) { replace(ZF.files.hashFor(ZF.settings.startPath || '/')); return; }
+    if (!r || !viewAllowed(r.name)) { replace(ZF.files.hashFor(ZF.auth.homePath())); return; }
     if (hash === lastHash && !(meta && meta.force)) return;
     lastHash = hash;
 
@@ -146,7 +152,7 @@
     e.preventDefault();
     var view = a.getAttribute('data-view');
     if (view === 'files') {
-      ZF.go(ZF.files.hashFor(ZF.files.current() || ZF.settings.startPath || '/'));
+      ZF.go(ZF.files.hashFor(ZF.files.current() || ZF.auth.homePath()));
     } else {
       ZF.go('#/' + view);
     }
@@ -267,6 +273,29 @@
   }
   ZF.on('status', renderInfo);
 
+  /* ── Login gate ─────────────────────────────────────────────────────── */
+
+  /* Hide what the signed-in account cannot use, and leave a view that just
+   * became off-limits (role change, sign-out) for the Files view. */
+  function applyRole() {
+    var items = ZF.$$('.nav-item');
+    for (var i = 0; i < items.length; i++) {
+      var name = items[i].getAttribute('data-view');
+      items[i].hidden = !viewAllowed(name);
+    }
+    if (current && !viewAllowed(current)) {
+      replace(ZF.files.hashFor(ZF.auth.homePath()));
+    } else if (current === 'files' && ZF.auth.isUser() && ZF.files.current() !== null &&
+               !ZF.auth.pathAllowed(ZF.files.current())) {
+      replace(ZF.files.hashFor(ZF.auth.homePath()));
+    } else if (ZF.auth.loggedIn() && current && ZF.views[current] && ZF.views[current].enter) {
+      /* Signed in: the views skipped their first load while the gate was up. */
+      route({ force: true });
+    }
+    if (ZF.auth.loggedIn()) ZF.transfers.refresh();
+  }
+  ZF.on('auth', applyRole);
+
   /* ── Transfers badge ────────────────────────────────────────────────── */
 
   var badge = $('nav-badge');
@@ -291,5 +320,4 @@
   }
   ZF.api.start();
   route();
-  ZF.transfers.refresh();
 })(ZF);

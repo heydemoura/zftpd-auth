@@ -421,6 +421,27 @@ All configuration is compile-time, in [`include/ftp/ftp_config.h`](include/ftp/f
 | `FTP_TRANSFER_RATE_BURST_BYTES` | *disabled* | Token-bucket burst allowance |
 | `FTP_LOG_COMMANDS` | — | Log every received command |
 
+### Web interface login (environment)
+
+The web interface can require a login. It is **off** unless configured; the
+settings are read from the environment when the daemon starts:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ZFTPD_ADMIN_PASSWORD` | *unset* | Turns the login gate on and creates (or resets) the administrator account |
+| `ZFTPD_ADMIN_USER` | `admin` | Login name of that administrator |
+| `ZFTPD_HTTP_AUTH` | *auto* | `0` forces the gate off, `1` forces it on. Unset: on whenever an administrator exists |
+| `ZFTPD_HTTP_SESSION_TTL` | `604800` | Session lifetime in seconds (7 days) |
+| `ZFTPD_STATE_DIR` | `/data/zftpd`, then `/tmp/zftpd` | Where accounts, folder rules and share links are stored |
+
+```bash
+ZFTPD_ADMIN_PASSWORD='change-me' ./zftpd-linux-x86_64-zhttp-v1.6.0.elf -d /srv/files
+```
+
+Accounts, folder rules and share links are persisted, so once an
+administrator exists the gate stays on across restarts even without the
+variable; set `ZFTPD_HTTP_AUTH=0` to open the interface again.
+
 ---
 
 ## 🌐 ZHTTP
@@ -436,7 +457,27 @@ Once the daemon is running, open `http://<ip>:<port>/` — the HTTP port mirrors
 
 Upload support is enabled automatically alongside ZHTTP (`ENABLE_WEB_UPLOAD=1`).
 
-> **Security:** ZHTTP has no authentication beyond network access. It is designed for local-network use. Do not expose it on a public interface.
+> **Security:** by default ZHTTP has no authentication beyond network access and is designed for local-network use. Start the daemon with `ZFTPD_ADMIN_PASSWORD` set to require a login (see [Configuration](#️-configuration)). Even then, do not expose it on a public interface: it speaks plain HTTP.
+
+### Accounts, roles and shared folders
+
+With the login gate on, every page and API call needs a session (cookie, or `Authorization: Bearer <token>` for scripts). Two roles exist:
+
+| Role | Can do |
+|---|---|
+| **Administrator** | Everything: files, transfers, games, system, share links, user management |
+| **User** | Browse, download, upload and edit files **only inside the folders an administrator allowed** (*Settings → Folders for users*). No share links, no system or console features |
+
+Administrators manage accounts under *Settings → Users*; each account is just a login and a password. The administrator created from the environment can add more administrators from there.
+
+### Share links
+
+Any file or folder can be shared with people who have no account: select it in Files and choose **Share…** (or right-click a folder background → *Share this folder…*). A share link looks like `http://<ip>:<port>/s/<id>`:
+
+- a **file** link downloads the file directly (resumable, works with `curl`/`wget`);
+- a **folder** link opens a plain page where the folder can be browsed, each file downloaded, and the whole folder fetched as a ZIP (`…?zip=1`).
+
+Links can expire after a chosen delay or on a given date, or never expire. The **Shares** view lists every link with its expiry, copies or opens it, and removes it; expired links answer `410 Gone` until purged. Only administrators create and manage shares.
 
 After console Rest Mode, ZHTTP auto-reconnects via `/api/status` (see [docs/restmode.md](docs/restmode.md)).
 

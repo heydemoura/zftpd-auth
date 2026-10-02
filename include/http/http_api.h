@@ -34,7 +34,7 @@ SOFTWARE.
 #include "http_parser.h"
 #include "http_response.h"
 
-http_response_t *http_api_handle(const http_request_t *request);
+http_response_t *http_api_handle(http_request_t *request);
 
 /**
  * @brief Attach the FTP server context to the HTTP API layer.

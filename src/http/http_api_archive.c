@@ -418,6 +418,7 @@ typedef struct {
   int id;
   zip_writer_t *zip;
   char name[128];
+  char owner[33]; /* login that prepared it (empty without the login gate) */
   time_t created;
 } zip_pending_t;
 
@@ -437,7 +438,8 @@ static void zip_pending_expire(void) {
   }
 }
 
-static int zip_pending_store(zip_writer_t *zip, const char *name) {
+static int zip_pending_store(zip_writer_t *zip, const char *name,
+                             const char *owner) {
   zip_pending_expire();
   for (size_t i = 0U; i < ZIP_PENDING_SLOTS; i++) {
     if (g_zip_pending[i].zip == NULL) {
@@ -446,16 +448,21 @@ static int zip_pending_store(zip_writer_t *zip, const char *name) {
       g_zip_pending[i].created = time(NULL);
       (void)snprintf(g_zip_pending[i].name, sizeof(g_zip_pending[i].name), "%s",
                      name);
+      (void)snprintf(g_zip_pending[i].owner, sizeof(g_zip_pending[i].owner),
+                     "%s", owner != NULL ? owner : "");
       return g_zip_pending[i].id;
     }
   }
   return 0;
 }
 
-static zip_writer_t *zip_pending_take(int id, char *name, size_t name_size) {
+/* A prepared archive can only be fetched by the login that prepared it. */
+static zip_writer_t *zip_pending_take(int id, const char *owner, char *name,
+                                      size_t name_size) {
   for (size_t i = 0U; i < ZIP_PENDING_SLOTS; i++) {
     zip_pending_t *slot = &g_zip_pending[i];
-    if (slot->zip != NULL && slot->id == id) {
+    if (slot->zip != NULL && slot->id == id &&
+        strcmp(slot->owner, owner != NULL ? owner : "") == 0) {
       zip_writer_t *zip = slot->zip;
       if (name != NULL && name_size > 0U)
         (void)snprintf(name, name_size, "%s", slot->name);
@@ -545,7 +552,8 @@ static http_response_t *api_archive_zip(const http_request_t *request) {
   if (id_param != NULL) {
     int id = atoi(id_param + 3);
     char pending_name[128] = {0};
-    zip_writer_t *prepared = zip_pending_take(id, pending_name,
+    zip_writer_t *prepared = zip_pending_take(id, request->auth_login,
+                                              pending_name,
                                               sizeof(pending_name));
     if (prepared == NULL) {
       return http_api_error_json(HTTP_STATUS_404_NOT_FOUND,
@@ -720,7 +728,7 @@ static http_response_t *api_archive_zip_prepare(const http_request_t *request) {
                                "Nothing to archive in this selection");
   }
 
-  int id = zip_pending_store(zip, name);
+  int id = zip_pending_store(zip, name, request->auth_login);
   if (id == 0) {
     zip_writer_destroy(zip); /* too many prepared archives in flight */
     return http_api_error_json(HTTP_STATUS_409_CONFLICT,
@@ -740,6 +748,11 @@ static http_response_t *api_archive_zip_prepare(const http_request_t *request) {
                      zip_writer_truncated(zip) != 0 ? "true" : "false");
   http_response_set_body(resp, body, (size_t)len);
   return resp;
+}
+
+http_response_t *http_api_archive_zip_response(struct zip_writer *zip,
+                                               const char *name) {
+  return zip_response_for(zip, name);
 }
 
 http_response_t *http_api_archive_handle(const http_request_t *request) {

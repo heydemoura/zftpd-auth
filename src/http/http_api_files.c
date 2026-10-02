@@ -335,6 +335,112 @@ static int parse_file_range(const char *header, uint64_t size,
   return 0;
 }
 
+/*
+ * Raw file download: zero-copy sendfile with Range support.  Shared by
+ * /api/file/get and the public share links.  @p safe is already confined.
+ */
+http_response_t *http_api_file_response(const char *safe,
+                                        const char *display_name,
+                                        const http_request_t *request) {
+  if (safe == NULL) return NULL;
+  if (display_name == NULL || display_name[0] == '\0') {
+    display_name = strrchr(safe, '/');
+    display_name = display_name != NULL ? display_name + 1 : safe;
+  }
+  /* Open file */
+  int fd = open(safe, O_RDONLY);
+  if (fd < 0) {
+    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "File not found");
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+    close(fd);
+    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Not a regular file");
+  }
+
+  uint64_t size = (uint64_t)st.st_size;
+  uint64_t first = 0;
+  uint64_t last = size == 0 ? 0 : size - 1;
+  const char *range = http_get_header(request, "Range");
+  if (range != NULL && parse_file_range(range, size, &first, &last) != 0) {
+    close(fd);
+    http_response_t *invalid =
+        http_response_create(HTTP_STATUS_416_RANGE_NOT_SATISFIABLE);
+    if (invalid == NULL) return NULL;
+    char content_range[80];
+    (void)snprintf(content_range, sizeof(content_range), "bytes */%" PRIu64,
+                   size);
+    http_response_add_header(invalid, "Content-Range", content_range);
+    http_response_add_header(invalid, "Accept-Ranges", "bytes");
+    http_response_add_header(invalid, "Content-Length", "0");
+    if (http_response_finalize(invalid) != 0) {
+      http_response_destroy(invalid);
+      return NULL;
+    }
+    return invalid;
+  }
+
+  /* Build response headers */
+  http_response_t *resp = http_response_create(
+      range != NULL ? HTTP_STATUS_206_PARTIAL_CONTENT : HTTP_STATUS_200_OK);
+  /*
+   * SAFETY: http_response_create() returns NULL when the response pool is
+   * exhausted (HTTP_MAX_CONNECTIONS concurrent responses already in flight).
+   * Without this check the subsequent struct-field assignments would
+   * dereference a NULL pointer, causing SIGSEGV.  The open fd must be closed
+   * here to prevent a file-descriptor leak — if we returned NULL without
+   * closing it, the fd would be lost forever because no other code path holds
+   * a reference to it.
+   *
+   * @pre  fd >= 0 and valid (opened above)
+   * @post On NULL return: fd is closed, no resources are leaked
+   */
+  if (resp == NULL) {
+    close(fd);
+    return NULL; /* http_handle_request() will synthesise a 500 response */
+  }
+  http_response_add_header(resp, "Content-Type", "application/octet-stream");
+  http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
+  http_response_add_header(resp, "Accept-Ranges", "bytes");
+  if (range != NULL) {
+    char content_range[96];
+    (void)snprintf(content_range, sizeof(content_range),
+                   "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
+                   first, last, size);
+    http_response_add_header(resp, "Content-Range", content_range);
+  }
+
+  char disposition[512];
+  snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"",
+           display_name);
+  http_response_add_header(resp, "Content-Disposition", disposition);
+
+  char len_str[32];
+  uint64_t response_size = range != NULL ? last - first + 1 : size;
+  snprintf(len_str, sizeof(len_str), "%" PRIu64, response_size);
+  http_response_add_header(resp, "Content-Length", len_str);
+
+  /*
+   * Finalize headers (appends the blank \r\n line that separates headers
+   * from the body).  Failure here means the response buffer is full —
+   * destroy the response and close the fd rather than sending a malformed
+   * HTTP message with missing header terminator.
+   *
+   * @post On failure: fd is closed, resp is freed, no resources are leaked
+   */
+  if (http_response_finalize(resp) != 0) {
+    close(fd);
+    http_response_destroy(resp);
+    return NULL;
+  }
+
+  resp->sendfile_fd = fd;
+  resp->sendfile_offset = (off_t)first;
+  resp->sendfile_count = (size_t)response_size;
+  return resp;
+}
+
 static http_response_t *api_download(const http_request_t *request) {
   const char *query = strchr(request->uri, '?');
   char path[PAL_PATH_MAX] = "";
@@ -409,105 +515,10 @@ static http_response_t *api_download(const http_request_t *request) {
   }
 #endif
 
-  /* Open file */
-  int fd = open(safe, O_RDONLY);
-  if (fd < 0) {
-    return http_api_error_json(HTTP_STATUS_404_NOT_FOUND, "File not found");
-  }
-
-  struct stat st;
-  if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
-    close(fd);
-    return http_api_error_json(HTTP_STATUS_400_BAD_REQUEST, "Not a regular file");
-  }
-
-  uint64_t size = (uint64_t)st.st_size;
-  uint64_t first = 0;
-  uint64_t last = size == 0 ? 0 : size - 1;
-  const char *range = http_get_header(request, "Range");
-  if (range != NULL && parse_file_range(range, size, &first, &last) != 0) {
-    close(fd);
-    http_response_t *invalid =
-        http_response_create(HTTP_STATUS_416_RANGE_NOT_SATISFIABLE);
-    if (invalid == NULL) return NULL;
-    char content_range[80];
-    (void)snprintf(content_range, sizeof(content_range), "bytes */%" PRIu64,
-                   size);
-    http_response_add_header(invalid, "Content-Range", content_range);
-    http_response_add_header(invalid, "Accept-Ranges", "bytes");
-    http_response_add_header(invalid, "Content-Length", "0");
-    if (http_response_finalize(invalid) != 0) {
-      http_response_destroy(invalid);
-      return NULL;
-    }
-    return invalid;
-  }
-
   /* Extract basename for Content-Disposition */
   const char *basename = strrchr(path, '/');
   basename = (basename != NULL) ? basename + 1 : path;
-
-  /* Build response headers */
-  http_response_t *resp = http_response_create(
-      range != NULL ? HTTP_STATUS_206_PARTIAL_CONTENT : HTTP_STATUS_200_OK);
-  /*
-   * SAFETY: http_response_create() returns NULL when the response pool is
-   * exhausted (HTTP_MAX_CONNECTIONS concurrent responses already in flight).
-   * Without this check the subsequent struct-field assignments would
-   * dereference a NULL pointer, causing SIGSEGV.  The open fd must be closed
-   * here to prevent a file-descriptor leak — if we returned NULL without
-   * closing it, the fd would be lost forever because no other code path holds
-   * a reference to it.
-   *
-   * @pre  fd >= 0 and valid (opened above)
-   * @post On NULL return: fd is closed, no resources are leaked
-   */
-  if (resp == NULL) {
-    close(fd);
-    return NULL; /* http_handle_request() will synthesise a 500 response */
-  }
-  http_response_add_header(resp, "Content-Type", "application/octet-stream");
-  http_response_add_header(resp, "Access-Control-Allow-Origin", "*");
-  http_response_add_header(resp, "Accept-Ranges", "bytes");
-  if (range != NULL) {
-    char content_range[96];
-    (void)snprintf(content_range, sizeof(content_range),
-                   "bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64,
-                   first, last, size);
-    http_response_add_header(resp, "Content-Range", content_range);
-  }
-
-  char disposition[512];
-  snprintf(disposition, sizeof(disposition), "attachment; filename=\"%s\"",
-           basename);
-  http_response_add_header(resp, "Content-Disposition", disposition);
-
-  char len_str[32];
-  uint64_t response_size = range != NULL ? last - first + 1 : size;
-  snprintf(len_str, sizeof(len_str), "%" PRIu64, response_size);
-  http_response_add_header(resp, "Content-Length", len_str);
-
-  /*
-   * Finalize headers (appends the blank \r\n line that separates headers
-   * from the body).  Failure here means the response buffer is full —
-   * destroy the response and close the fd rather than sending a malformed
-   * HTTP message with missing header terminator.
-   *
-   * @post On failure: fd is closed, resp is freed, no resources are leaked
-   */
-  if (http_response_finalize(resp) != 0) {
-    close(fd);
-    http_response_destroy(resp);
-    return NULL;
-  }
-
-  resp->sendfile_fd = fd;
-  resp->sendfile_offset = (off_t)first;
-  resp->sendfile_count = (size_t)response_size;
-
-
-
-  return resp;
+  return http_api_file_response(safe, basename, request);
 }
 
 

@@ -38,6 +38,13 @@ http_response_t *http_api_archive_progress(const http_request_t *request);
 http_response_t *http_api_archive_cancel(const http_request_t *request);
 
 http_response_t *http_api_files_handle(const http_request_t *request);
+http_response_t *http_api_file_response(const char *safe,
+                                        const char *display_name,
+                                        const http_request_t *request);
+http_response_t *http_api_auth_handle(const http_request_t *request);
+struct zip_writer;
+http_response_t *http_api_archive_zip_response(struct zip_writer *zip,
+                                               const char *name);
 http_response_t *http_api_process_handle(const http_request_t *request);
 http_response_t *http_api_system_handle(const http_request_t *request);
 uint64_t http_api_dir_size_with_partial(const char *path, int *out_partial);

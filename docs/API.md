@@ -11,7 +11,8 @@ with, so views can hide what the build does not have.
 ```json
 {"ok":true,"version":"1.6.0","instance_id":"15114b8a2c31d9f0",
  "start_monotonic_ns":463980095296000,"pid":74,"platform":"ps4",
- "features":{"pkg_install":false}}
+ "features":{"pkg_install":false},
+ "auth":{"enabled":true,"authenticated":false,"user":"","role":"none"}}
 ```
 
 - `instance_id` changes when the payload is re-injected: clients treat it as a
@@ -19,6 +20,106 @@ with, so views can hide what the build does not have.
 - `features.pkg_install` mirrors the `ENABLE_PKG_INSTALL` build flag. When it is
   `false` the package installer endpoints answer `409 PKG installation is
   disabled for this build` and the UI hides the installer entirely.
+- `auth` describes the login gate (see below). `/api/status` itself never
+  requires a login so clients can always discover the gate.
+
+## Login gate
+
+The gate is off unless the daemon was started with `ZFTPD_ADMIN_PASSWORD`
+(see the README). When it is on, every `/api/*` route except `/api/status`,
+`/api/auth/login`, `/api/auth/logout` and `/api/auth/me` needs a session, sent
+either as the `zftpd_session` cookie set by the login call or as
+`Authorization: Bearer <token>`. Unauthenticated calls answer
+`401 {"error":"Login required","auth":"required"}`.
+
+Two roles exist. `admin` may call everything. `user` may call only the file
+routes (`/api/list`, `/api/dirsize`, `/api/file/get`, `/api/download`,
+`/api/create_file`, `/api/mkdir`, `/api/delete`, `/api/rename`, `/api/copy*`,
+`/api/upload`, `/api/extract*`, `/api/archive/zip`, `/api/stats*`,
+`/api/disk/info`, `/api/mounts`, `/api/game/meta`, `/api/game/icon`,
+`/api/auth/password`) and every path those calls carry (`path`, `dst`, `paths`,
+`dest`) must be inside one of the allowed folders, otherwise
+`403 {"error":"...","auth":"folder"}`. Other routes answer
+`403 {"auth":"admin"}` for users.
+
+POST calls still need the `X-CSRF-Token` header taken from `index.html`.
+
+### POST /api/auth/login
+
+Body `{"login":"admin","password":"..."}`. Answers `200` with the session
+cookie and `{"ok":true,"enabled":true,"user":"admin","role":"admin",
+"token":"<64 hex>","expires_in":604800}`; a wrong password answers `401` after
+a short delay. With the gate off it answers `{"ok":true,"enabled":false,...}`.
+
+### POST /api/auth/logout
+
+Ends the session and clears the cookie.
+
+### GET /api/auth/me
+
+`{"ok":true,"enabled":true,"authenticated":true,"user":"bob","role":"user",
+"folders":["/data/shared"]}` — `folders` is the allow-list for the user role.
+
+### POST /api/auth/password
+
+Body `{"current":"...","password":"..."}`: changes the caller's own password
+(6 to 128 characters).
+
+### Users (administrators)
+
+- `GET /api/auth/users` → `{"ok":true,"users":[{"login":"admin","role":"admin"}]}`
+- `POST /api/auth/users` body `{"login","password","role"}` creates an account.
+  Logins are 1–32 characters from `A-Z a-z 0-9 . _ - @`; role is `admin` or `user`.
+- `POST /api/auth/users/update` body `{"login","password"?,"role"?}`. A new
+  password signs that user out everywhere. The caller cannot change their own
+  role; the last administrator cannot be demoted.
+- `POST /api/auth/users/delete` body `{"login"}`. The caller cannot delete
+  their own account; the last administrator cannot be removed.
+
+Each call answers with the updated user list.
+
+### Folder rules (administrators)
+
+- `GET /api/auth/access` → `{"ok":true,"folders":[...]}`
+- `POST /api/auth/access` body `{"folders":["/data/shared", ...]}` replaces
+  the list (32 folders at most; each must exist inside the served root).
+
+## Share links
+
+A share makes one file or folder reachable **without a login** at
+`/s/<id>` (`id` = 32 hex characters). Shares are persisted and may expire.
+
+- `GET /s/<id>` — file share: direct download (`Content-Disposition:
+  attachment`, `Range` supported). Folder share: HTML listing.
+- `GET /s/<id>/<sub/path>` — a file (download) or sub-folder (listing) inside a
+  shared folder. Nothing outside the shared folder is reachable.
+- `GET /s/<id>/<sub>?zip=1` — the folder streamed as a ZIP archive.
+- An unknown id answers `404`; an expired link answers `410 Gone`.
+
+### GET /api/shares (administrators)
+
+```json
+{"ok":true,"now":1790910000,"shares":[
+ {"id":"cbc3e1733df411af5870e654121f9498","path":"/data/pub","name":"pub",
+  "type":"directory","url":"/s/cbc3e1733df411af5870e654121f9498",
+  "created":1790910297,"expires":1790913897,"expired":false,"owner":"admin"}]}
+```
+
+`expires` is a Unix time, `0` meaning never.
+
+### POST /api/shares/create (administrators)
+
+Body `{"path":"/data/pub","ttl":3600}` or `{"path":"...","expires":<unix>}`
+(omit both, or `"expires":0`, for a link that never expires). Answers
+`{"ok":true,"share":{...}}` with the record shown above.
+
+### POST /api/shares/delete (administrators)
+
+Body `{"id":"..."}`. Removes the link immediately.
+
+### POST /api/shares/purge (administrators)
+
+Removes every expired link; answers `{"ok":true,"removed":N}`.
 
 ### GET /api/list
 

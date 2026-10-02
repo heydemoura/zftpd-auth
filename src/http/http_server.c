@@ -29,7 +29,9 @@ SOFTWARE.
 #include "ftp_log.h"
 #include "http_api.h"
 #include "http_api_internal.h"
+#include "http_auth.h"
 #include "http_config.h"
+#include "http_share.h"
 #include "http_parser.h"
 #include "http_response.h"
 #include "http_response_stream.h"
@@ -70,6 +72,9 @@ typedef struct {
   http_request_t request;
   char range_name[6];
   char range_value[128];
+  /* The login gate runs again on the worker thread: keep the session. */
+  char cookie_name[7];
+  char cookie_value[HTTP_AUTH_TOKEN_HEX + 32U];
 } http_background_request_t;
 
 /* A game dump can take minutes. Send it outside the event loop so status
@@ -296,7 +301,8 @@ static int http_handle_request(http_connection_t *conn, size_t request_length) {
       ((strncmp(request.uri, "/api/file/get", 13) == 0 &&
         (request.uri[13] == '?' || request.uri[13] == '\0')) ||
        (strncmp(request.uri, "/api/download", 13) == 0 &&
-        (request.uri[13] == '?' || request.uri[13] == '\0')))) {
+        (request.uri[13] == '?' || request.uri[13] == '\0')) ||
+       http_share_route_matches(request.uri))) {
     http_background_request_t *task = calloc(1U, sizeof(*task));
     if (task != NULL) {
       task->fd = dup(conn->fd);
@@ -314,6 +320,16 @@ static int http_handle_request(http_connection_t *conn, size_t request_length) {
         task->request.headers[0].name = task->range_name;
         task->request.headers[0].value = task->range_value;
         task->request.num_headers = 1;
+      }
+      char token[HTTP_AUTH_TOKEN_HEX + 1U];
+      if (http_auth_request_token(&request, token, sizeof(token)) == 0) {
+        memcpy(task->cookie_name, "Cookie", sizeof(task->cookie_name));
+        (void)snprintf(task->cookie_value, sizeof(task->cookie_value),
+                       HTTP_AUTH_COOKIE_NAME "=%s", token);
+        size_t slot = task->request.num_headers;
+        task->request.headers[slot].name = task->cookie_name;
+        task->request.headers[slot].value = task->cookie_value;
+        task->request.num_headers = slot + 1U;
       }
       if (task->fd >= 0) {
         pthread_t tid;

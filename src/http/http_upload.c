@@ -3,6 +3,7 @@
 
 #include "ftp_path.h"
 #include "http_api_internal.h"
+#include "http_auth.h"
 #include "http_csrf.h"
 #include "http_response.h"
 #include "pal_fileio.h"
@@ -90,8 +91,22 @@ int http_upload_start(http_connection_t *conn, const http_request_head_t *head) 
   }
 
   http_request_t request;
-  if (http_parse_request(conn->buffer, head->header_length, &request) < 0 ||
-      http_csrf_validate(&request) != 0) {
+  if (http_parse_request(conn->buffer, head->header_length, &request) < 0) {
+    (void)upload_send_json(conn, HTTP_STATUS_400_BAD_REQUEST,
+                           "{\"error\":\"Malformed request\"}");
+    return -1;
+  }
+
+  /* Uploads bypass http_api_handle(): apply the login gate here. */
+  http_response_t *denied = http_auth_gate(&request, NULL);
+  if (denied != NULL) {
+    if (denied->used > 0U)
+      (void)pal_send_all(conn->fd, denied->data, denied->used, 0);
+    http_response_destroy(denied);
+    return -1;
+  }
+
+  if (http_csrf_validate(&request) != 0) {
     (void)upload_send_json(conn, HTTP_STATUS_403_FORBIDDEN,
                            "{\"error\":\"Invalid or missing CSRF token\"}");
     return -1;
