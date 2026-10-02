@@ -8,8 +8,10 @@
 
 services:
   zftpd:
+    # Prebuilt image published by GitHub Actions on every commit to main;
+    # `docker compose build` rebuilds it locally from the Dockerfile instead.
+    image: ghcr.io/heydemoura/zftpd-auth:latest
     build: .
-    image: zftpd:latest
     container_name: zftpd
     restart: unless-stopped
     # Run as the host user that owns the files directory so uploads, renames

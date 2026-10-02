@@ -404,8 +404,13 @@ ports, the files volume, the persisted web state and every environment variable:
 
 ```bash
 cp -n /dev/null .env            # optional: ZFTPD_ADMIN_PASSWORD=..., ZFTPD_FILES=/srv/files, ZFTPD_UID=$(id -u)
-docker compose up -d --build    # FTP on 2121, web interface on http://<host>:8888
+docker compose up -d            # FTP on 2121, web interface on http://<host>:8888
 ```
+
+Every commit on `main` publishes a multi-arch (amd64, arm64) image to
+`ghcr.io/heydemoura/zftpd-auth` (`latest`, `main`, `sha-<commit>`; version
+tags add `1.6.0` and `1.6`) through the [Docker workflow](.github/workflows/docker.yml).
+Use `docker compose up -d --build` to build from the local sources instead.
 
 The service uses host networking because FTP passive mode opens a random data
 port per transfer, which cannot be published through Docker's NAT; for a
